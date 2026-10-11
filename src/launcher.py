@@ -8,7 +8,6 @@ from urllib.error import HTTPError
 from replay_store import Store
 from updater import VERSION, download_latest
 from engine import ADAPTER, launch_engine, collect_completed
-from steam_launch import launch_steam_game
 
 DEFAULT_GAME = Path(r'C:\Program Files (x86)\Steam\steamapps\common\Kingdom Under Fire War of Heroes\KingdomUnderFire.exe')
 
@@ -31,7 +30,7 @@ class Launcher:
         self.game_path = tk.StringVar(value=self.store.config.get('game_path', str(DEFAULT_GAME)))
         ttk.Entry(game, textvariable=self.game_path).pack(side='left', fill='x', expand=True)
         ttk.Button(game, text='게임 경로', command=self.pick_game).pack(side='left', padx=5)
-        ttk.Label(outer, text='게임 실행은 Steam을 사용합니다. 초기 계정 안내창에서는 ‘아니요’를 누르세요.').pack(anchor='w', pady=(8,0))
+        ttk.Label(outer, text='Steam 실행 + 싱글플레이 자동 기록 · 실행 중인 게임은 먼저 닫으세요 · 계정 안내창은 ‘아니요’').pack(anchor='w', pady=(8,0))
         controls = ttk.Frame(outer)
         controls.pack(fill='x', pady=14)
         for title, fn in [('폴더 열기', self.open_folder), ('리플레이 가져오기', self.import_replay), ('기존 폴더 이전', self.migrate), ('새로고침', self.refresh), ('런처 업데이트', self.update)]:
@@ -60,7 +59,6 @@ class Launcher:
         ttk.Button(actions, text='영구저장 / 해제', command=self.toggle_pin).pack(side='left', padx=8)
         self.game_button = ttk.Button(actions, text='게임 실행 (Steam)', command=self.start_game)
         self.game_button.pack(side='right')
-        ttk.Button(actions, text='실험용 기록 실행', command=self.start_recording).pack(side='right', padx=8)
         self.status = tk.StringVar(value=f'저장 폴더: {self.store.replays}')
         ttk.Label(outer, textvariable=self.status, wraplength=930).pack(anchor='w')
         self.work(self.store.listing, self.render)
@@ -188,12 +186,8 @@ class Launcher:
             self.store.save()
 
     def start_game(self):
-        self.work(launch_steam_game, lambda _: self.status.set('Steam에 게임 실행 요청을 보냈습니다. 계정 안내창에서는 ‘아니요’를 누르세요. 이 실행에는 기록 엔진이 연결되지 않습니다.'))
-
-    def start_recording(self):
-        path = Path(self.game_path.get())
-        if messagebox.askokcancel('실험용 기록 실행', '이 경로는 게임 EXE를 직접 실행합니다. Steam 실행 게임에 기록 엔진을 연결하는 기능은 아직 미지원입니다.\n\n일반 게임 실행은 하단의 ‘게임 실행 (Steam)’을 사용하세요.\n직접 실행 방식으로 기록 엔진을 시험하시겠습니까?'):
-            self.work(lambda:launch_engine(path,self.store),lambda pid:self.status.set(f'기록 엔진 연결 · PID {pid} · 싱글플레이 경기 종료 후 자동 저장'))
+        path=Path(self.game_path.get())
+        self.work(lambda:launch_engine(path,self.store,mode='steam-record'), lambda pid:self.status.set(f'Steam 게임 기록 엔진 연결 완료 · PID {pid} · 싱글플레이 경기를 끝내고 메뉴로 돌아오면 자동 저장'))
 
     def update(self):
         def run():

@@ -229,7 +229,7 @@ def launch_engine(game, store, mode='record', replay=None):
         staged,_=stage_playback(replay,game,store)
     try:
         result=subprocess.run([str(helper),str(game),str(dll),str(store.root),mode,str(staged or '-')],
-                              capture_output=True,text=True,timeout=40,creationflags=subprocess.CREATE_NO_WINDOW)
+                              capture_output=True,text=True,timeout=100 if mode=='steam-record' else 40,creationflags=subprocess.CREATE_NO_WINDOW)
         if result.returncode:
             raise ValueError(result.stderr.strip() or '엔진 초기화 실패: engine.log 확인')
         return int(result.stdout.strip())

@@ -22,6 +22,7 @@ uint32_t __fastcall fakeAdvance(void* self,void*,uint32_t,uint32_t) {
 uint32_t __fastcall fakeCount(void*,void*) {return queueCount;}
 uint32_t __fastcall fakePop(void*,void*,void*,uint32_t*) {--queueCount;return 4;}
 void resetState() {
+    closePending.store(false);closeReady.store(false);
     failed.store(false);terminal.store(false);notice.store(0);active=false;producer=0;cursor=8;
     resource=100;applied=0;at<uint32_t>(0xb8a280)=1;at<uint32_t>(0xbed1e8)=0;at<uint32_t>(0xb827dc)=0;
 }
@@ -62,6 +63,13 @@ int main() {
     require(failed.load() && notice.load()==8 && applied==2,"detect later simulation divergence");
     resetState();playback=false;producer=GetCurrentThreadId();tail.store(0);head.store(RingSize-1);
     State s{};emit(Before,&s,sizeof(s));require(failed.load() && notice.load()==2,"bounded ring overflow fails without blocking");
+    resetState();head.store(0);tail.store(0);at<void*>(0xb8282c)=&self;
+    advanceHook(&self,nullptr,0,0);
+    uint32_t beforeClose=head.load();
+    require(recordingWindowProc(nullptr,WM_CLOSE,0,0)==0 && closePending.load() && !active,"normal close queues match ending without blocking");
+    require(head.load()==beforeClose+sizeof(Record)+sizeof(State),"exactly one close end record");
+    uint32_t afterClose=head.load();
+    require(recordingWindowProc(nullptr,WM_CLOSE,0,0)==0 && head.load()==afterClose,"repeated close waits for writer acknowledgement");
     resetState();patches.clear();
     auto call=(unsigned char*)address(0x4cfc55);call[0]=0xe8;
     delta=(int32_t)((uintptr_t)address(0x4daf50)-(uintptr_t)call-5);memcpy(call+1,&delta,4);

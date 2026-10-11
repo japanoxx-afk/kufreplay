@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <tlhelp32.h>
 #include <atomic>
 #include <vector>
 #include <string>
@@ -29,6 +30,9 @@ uintptr_t textBase=0;
 uint32_t textSize=0;
 HANDLE logFile=INVALID_HANDLE_VALUE;
 std::atomic<int> notice{0};
+HWND gameWindow=nullptr;
+WNDPROC oldWindowProc=nullptr;
+std::atomic<bool> closePending{false},closeReady{false};
 
 template<class T> T& at(uint32_t va) {return *reinterpret_cast<T*>(base+va-0x400000);}
 void* address(uint32_t va) {return reinterpret_cast<void*>(base+va-0x400000);}
@@ -122,6 +126,25 @@ void fillInitial(void* self,Initial& value) {
     for(uint32_t i=0;i<11;++i) memcpy(value.slots[i],address(0xb83cdc+i*0x40c),12);
 }
 
+LRESULT CALLBACK recordingWindowProc(HWND window,UINT message,WPARAM wparam,LPARAM lparam) {
+    if(message==WM_CLOSE && closePending.load() && !closeReady.load()) return 0;
+    if(message==WM_CLOSE && !playback && !closeReady.load() && active && !failed.load()) {
+        if(!closePending.exchange(true)) finish(at<void*>(0xb8282c));
+        // The writer completes asynchronously; no disk waits on the simulation thread.
+        return 0;
+    }
+    return CallWindowProcW(oldWindowProc,window,message,wparam,lparam);
+}
+
+BOOL CALLBACK findGameWindow(HWND window,LPARAM) {
+    DWORD pid=0;GetWindowThreadProcessId(window,&pid);
+    wchar_t title[128]{};GetWindowTextW(window,title,128);
+    if(pid==GetCurrentProcessId() && !wcscmp(title,L"Kingdom Under Fire") && !GetWindow(window,GW_OWNER)) {
+        gameWindow=window;return FALSE;
+    }
+    return TRUE;
+}
+
 uint32_t __fastcall commandHook(void* self,void*,uint32_t length,const void* bytes) {
     if(active && inDispatch && !playback && !failed.load()) {
         if(length<2 || length>MaxCommand) invalidate(4);
@@ -154,6 +177,7 @@ bool discardLiveQueue() {
 }
 
 uint32_t __fastcall advanceHook(void* self,void*,uint32_t a,uint32_t b) {
+    if(closePending.load()) return advance(self,a,b);
     if(failed.load()) return playback?1:advance(self,a,b);
     // Multiplayer recording/replay is deliberately disabled until host latency and sync are measured.
     if(at<unsigned char>(0xb83ad0)!=0) {
@@ -321,18 +345,55 @@ bool readInput(const wchar_t* path) {
     CloseHandle(f);return ok;
 }
 
-DWORD WINAPI worker(void*) {
-    wchar_t buffer[32768];GetEnvironmentVariableW(L"KUF_REPLAY_ROOT",buffer,32768);root=buffer;
+DWORD WINAPI worker(void* argument) {
+    ReplayStartConfig config{};
+    if(argument) {config=*(ReplayStartConfig*)argument;delete (ReplayStartConfig*)argument;}
+    wchar_t buffer[32768]{};
+    if(argument) root=config.root;
+    else {GetEnvironmentVariableW(L"KUF_REPLAY_ROOT",buffer,32768);root=buffer;}
     CreateDirectoryW(root.c_str(),nullptr);
     std::wstring inbox=root+L"\\CaptureInbox";CreateDirectoryW(inbox.c_str(),nullptr);
     logFile=CreateFileW((root+L"\\engine.log").c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
-    GetEnvironmentVariableW(L"KUF_REPLAY_MODE",buffer,32768);playback=!wcscmp(buffer,L"play");
+    if(argument) playback=config.playback!=0;
+    else {GetEnvironmentVariableW(L"KUF_REPLAY_MODE",buffer,32768);playback=!wcscmp(buffer,L"play");}
     base=(uintptr_t)GetModuleHandleW(nullptr);
     bool ok=verifyText();
     if(!ok) log("Rejected: runtime executable code differs from relocated original image.");
-    if(ok && playback) {GetEnvironmentVariableW(L"KUF_REPLAY_INPUT",buffer,32768);ok=readInput(buffer);}
+    if(ok && argument && at<void*>(0xb8282c)) {
+        ok=false;log("Rejected: match object already exists. Start recording before entering a match.");
+    }
+    if(ok && playback) {
+        if(argument) ok=readInput(config.input);
+        else {GetEnvironmentVariableW(L"KUF_REPLAY_INPUT",buffer,32768);ok=readInput(buffer);}
+    }
     ring=(unsigned char*)VirtualAlloc(nullptr,RingSize,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
     ok=ok && ring;
+    std::vector<HANDLE> paused;
+    if(ok && argument) {
+        HANDLE threads=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+        THREADENTRY32 entry{};entry.dwSize=sizeof(entry);
+        for(BOOL next=Thread32First(threads,&entry);next;next=Thread32Next(threads,&entry)) {
+            if(entry.th32OwnerProcessID==GetCurrentProcessId() && entry.th32ThreadID!=GetCurrentThreadId()) {
+                HANDLE h=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_QUERY_INFORMATION,FALSE,entry.th32ThreadID);
+                if(h) paused.push_back(h);else ok=false;
+            }
+        }
+        CloseHandle(threads);
+        size_t suspended=0;
+        for(auto h:paused) {
+            if(SuspendThread(h)==(DWORD)-1) {ok=false;break;}
+            ++suspended;
+            CONTEXT context{};context.ContextFlags=CONTEXT_CONTROL;
+            if(!GetThreadContext(h,&context)) ok=false;
+            // Do not replace a prologue already being executed by another thread.
+            for(uint32_t va:{0x4cf2b0u,0x4c09f0u}) {
+                uintptr_t p=(uintptr_t)address(va);
+                if(context.Eip>p && context.Eip<p+6) ok=false;
+            }
+        }
+        for(size_t i=suspended;i<paused.size();++i) CloseHandle(paused[i]);
+        paused.resize(suspended);
+    }
     if(ok) {
         advance=reinterpret_cast<Advance>(address(0x4daf50));apply=reinterpret_cast<Apply>(address(0x4db870));
         ok=patchCall(0x4cfc55,0x4daf50,(void*)advanceHook) && patchCall(0x4db124,0x4db870,(void*)commandHook) && patchCall(0x4db170,0x4db870,(void*)commandHook);
@@ -344,15 +405,26 @@ DWORD WINAPI worker(void*) {
         if(ok) {destroy=reinterpret_cast<Destroy>(patchEntry(0x4c09f0,destroyPrefix,sizeof(destroyPrefix),(void*)destroyHook));ok=destroy!=nullptr;}
     }
     if(!ok) {restore();log("Initialization failed; all installed owned patches restored.");}
+    for(auto h:paused) {ResumeThread(h);CloseHandle(h);}
     HANDLE marker=CreateFileW((root+L"\\engine.ready").c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_ALWAYS,0,nullptr);
     DWORD n=0;char ready=ok?'1':'0';if(marker!=INVALID_HANDLE_VALUE) {WriteFile(marker,&ready,1,&n,nullptr);CloseHandle(marker);}
-    GetEnvironmentVariableW(L"KUF_REPLAY_READY",buffer,32768);
+    if(argument) wcscpy_s(buffer,config.event);
+    else GetEnvironmentVariableW(L"KUF_REPLAY_READY",buffer,32768);
     HANDLE event=OpenEventW(EVENT_MODIFY_STATE,FALSE,buffer);if(event) {SetEvent(event);CloseHandle(event);}
     if(!ok) return 1;
     log(playback?"Playback adapter ready. Waiting for identical game-native match setup.":"Recording adapter ready. Single-player only; multiplayer intentionally excluded.");
     HANDLE file=INVALID_HANDLE_VALUE;std::wstring partial;uint32_t fileBytes=0,number=0;
     ULONGLONG checkAt=GetTickCount64();int lastNotice=0;
     for(;;) {
+        if(!playback && !gameWindow) {
+            EnumWindows(findGameWindow,0);
+            if(gameWindow) {
+                oldWindowProc=(WNDPROC)GetWindowLongPtrW(gameWindow,GWLP_WNDPROC);
+                if(!oldWindowProc || !SetWindowLongPtrW(gameWindow,GWLP_WNDPROC,(LONG_PTR)recordingWindowProc)) {
+                    gameWindow=nullptr;oldWindowProc=nullptr;
+                }
+            }
+        }
         uint32_t t=tail.load(std::memory_order_relaxed),h=head.load(std::memory_order_acquire);
         if(h-t>=sizeof(Record)) {
             Record record{};readRing(t,&record,sizeof(record));
@@ -375,10 +447,12 @@ DWORD WINAPI worker(void*) {
                     CloseHandle(file);file=INVALID_HANDLE_VALUE;
                     if(!failed.load() && !MoveFileW(partial.c_str(),(partial+L".complete").c_str())) invalidate(11);
                     else if(!failed.load()) log("Match capture finalized. Launcher can validate and package it.");
+                    if(closePending.load()) {closeReady.store(true);PostMessageW(gameWindow,WM_CLOSE,0,0);}
                 }
             }
             tail.store(t+sizeof(record)+record.size,std::memory_order_release);
         } else Sleep(10);
+        if(closePending.load() && failed.load() && !closeReady.exchange(true)) PostMessageW(gameWindow,WM_CLOSE,0,0);
         int issue=notice.load();
         if(issue!=lastNotice) {char line[100];wsprintfA(line,"Engine status code: %d (see docs/ENGINE_NATIVE.md)",issue);log(line);lastNotice=issue;}
         if(GetTickCount64()-checkAt>2000 && !terminal.load()) {
@@ -393,11 +467,25 @@ DWORD WINAPI worker(void*) {
 }
 }
 
+#pragma comment(linker,"/EXPORT:StartReplay=_StartReplay@4")
+extern "C" DWORD WINAPI StartReplay(void* argument) {
+    static std::atomic<bool> started{false};
+    if(!argument || started.exchange(true)) return 0;
+    auto config=new ReplayStartConfig(*(ReplayStartConfig*)argument);
+    config->root[1023]=0;config->input[1023]=0;config->event[127]=0;
+    HANDLE thread=CreateThread(nullptr,0,worker,config,0,nullptr);
+    if(!thread) {delete config;return 0;}
+    CloseHandle(thread);return 1;
+}
+
 BOOL WINAPI DllMain(HINSTANCE instance,DWORD reason,LPVOID) {
     if(reason==DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(instance);
-        HANDLE thread=CreateThread(nullptr,0,worker,nullptr,0,nullptr);
-        if(thread) CloseHandle(thread);else return FALSE;
+        wchar_t rootBuffer[1024]{};
+        if(GetEnvironmentVariableW(L"KUF_REPLAY_ROOT",rootBuffer,1024)) {
+            HANDLE thread=CreateThread(nullptr,0,worker,nullptr,0,nullptr);
+            if(thread) CloseHandle(thread);else return FALSE;
+        }
     }
     // Abrupt shutdown leaves .partial; no loader-lock disk waits or falsely complete replay.
     return TRUE;

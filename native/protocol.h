@@ -1,4 +1,13 @@
 #pragma once
+
+#ifdef _WIN32
+struct ReplayStartConfig {
+    wchar_t root[1024];
+    wchar_t input[1024];
+    wchar_t event[128];
+    unsigned int playback;
+};
+#endif
 #include <cstdint>
 namespace kuf {
 constexpr char Magic[8] = {'K','U','F','T','R','C','0','1'};
