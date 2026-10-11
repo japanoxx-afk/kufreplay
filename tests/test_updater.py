@@ -10,8 +10,8 @@ import updater
 
 class UpdaterTests(unittest.TestCase):
     def release(self, checksum):
-        prefix = 'https://github.com/japanoxx-afk/kufreplay/releases/download/v0.2.0/'
-        return json.dumps({'tag_name':'v0.2.0', 'assets':[
+        prefix = 'https://github.com/japanoxx-afk/kufreplay/releases/download/v0.3.0/'
+        return json.dumps({'tag_name':'v0.3.0', 'assets':[
             {'name':updater.ASSET, 'browser_download_url':prefix + updater.ASSET},
             {'name':updater.ASSET + '.sha256', 'browser_download_url':prefix + updater.ASSET + '.sha256'}]}).encode()
 
@@ -30,7 +30,7 @@ class UpdaterTests(unittest.TestCase):
             self.assertEqual(list(Path(root).rglob('*.exe')), [])
 
     def test_current_version_no_download(self):
-        with patch.object(updater, 'read_url', return_value=b'{"tag_name":"v0.1.0"}') as call:
+        with patch.object(updater, 'read_url', return_value=json.dumps({'tag_name':'v'+updater.VERSION}).encode()) as call:
             self.assertIsNone(updater.download_latest('unused'))
             self.assertEqual(call.call_count, 1)
 

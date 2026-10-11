@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from replay_store import Store
 from updater import VERSION, download_latest
+from engine import ADAPTER, launch_engine, collect_completed
 
 DEFAULT_GAME = Path(r'C:\Program Files (x86)\Steam\steamapps\common\Kingdom Under Fire War of Heroes\KingdomUnderFire.exe')
 ANALYZED_HASH = '69f2575ad14c78d3c6f7c15d0187234be005f06abf095d3f1bd602f1c3722868'
@@ -26,13 +27,15 @@ class Launcher:
         outer = ttk.Frame(root, padding=18)
         outer.pack(fill='both', expand=True)
         ttk.Label(outer, text='KINGDOM UNDER FIRE · REPLAY', font=('Segoe UI', 18, 'bold')).pack(anchor='w')
-        ttk.Label(outer, text='게임 기록·재생 엔진 미연결 — 보관함과 업데이트 기능을 사용할 수 있습니다.', foreground='#b45309').pack(anchor='w', pady=(6, 14))
+        ttk.Label(outer, text='실험용 엔진: 싱글플레이 · 재생 시 같은 지도/설정으로 경기 시작 필요 · 실경기 재현 검증 전', foreground='#b45309').pack(anchor='w', pady=(6, 14))
         game = ttk.Frame(outer)
         game.pack(fill='x')
         self.game_path = tk.StringVar(value=self.store.config.get('game_path', str(DEFAULT_GAME)))
         ttk.Entry(game, textvariable=self.game_path).pack(side='left', fill='x', expand=True)
         ttk.Button(game, text='게임 경로', command=self.pick_game).pack(side='left', padx=5)
         ttk.Button(game, text='게임 실행', command=self.start_game).pack(side='left')
+        self.record = tk.BooleanVar(value=True)
+        ttk.Checkbutton(outer, text='싱글플레이 경기 자동 기록 (실험용, 현재 실행 중인 게임은 먼저 닫아야 합니다)', variable=self.record).pack(anchor='w', pady=(8,0))
         controls = ttk.Frame(outer)
         controls.pack(fill='x', pady=14)
         for title, fn in [('폴더 열기', self.open_folder), ('리플레이 가져오기', self.import_replay), ('기존 폴더 이전', self.migrate), ('새로고침', self.refresh), ('런처 업데이트', self.update)]:
@@ -63,6 +66,20 @@ class Launcher:
         ttk.Label(outer, textvariable=self.status, wraplength=930).pack(anchor='w')
         self.work(self.store.listing, self.render)
         root.after(100, self.poll)
+        root.after(2000, self.collect)
+
+    def collect(self):
+        if not self.busy and any((self.store.root/'CaptureInbox').glob('*.partial.complete')):
+            game_path = self.game_path.get()
+            def run():
+                completed, errors=collect_completed(game_path,self.store)
+                return self.store.listing(), completed, errors
+            def done(result):
+                items, completed, errors=result
+                self.render(items)
+                self.status.set(f'{len(completed)}개 자동 저장' if not errors else '기록 검증 실패: '+ '; '.join(errors))
+            self.work(run,done)
+        self.root.after(2000,self.collect)
 
     def work(self, fn, done):
         if self.busy:
@@ -95,7 +112,9 @@ class Launcher:
         self.rows = {}
         for p, m, pin in items:
             duration = m['ticks'] // m['tick_rate']
-            row = self.tree.insert('', 'end', values=(m['recorded_at'], m['map_id'], f'{duration//60}:{duration%60:02d}', '★' if pin else '', '재생 어댑터 미구현'))
+            time_text=f'{duration//60}:{duration%60:02d}' if m.get('duration_verified',True) else f"{m['ticks']}틱"
+            compat='실험용 · 같은 경기 설정 필요' if m['adapter_id']==ADAPTER else '호환 어댑터 없음'
+            row = self.tree.insert('', 'end', values=(m['recorded_at'], m['map_id'], time_text, '★' if pin else '', compat))
             self.rows[row] = (p, m, pin)
         self.status.set(f'{len(items)}개 · {self.store.replays}')
 
@@ -112,7 +131,14 @@ class Launcher:
     def play(self):
         item = self.selected()
         if item:
-            messagebox.showwarning('재생 미지원', '이 게임 빌드의 명령 주입·초기 상태 복원 어댑터가 아직 구현되지 않았습니다.\n파일 구조 검증 통과만으로 경기 재현을 보장할 수 없습니다.')
+            p,m,_=item
+            game=self.game_path.get()
+            def run():
+                return launch_engine(game,self.store,mode='play',replay=p)
+            def done(pid):
+                self.status.set(f'재생 엔진 연결 · PID {pid} · 게임에서 같은 지도/진영/슬롯/규칙으로 시작하세요.')
+                messagebox.showinfo('실험용 재생 준비', f"지도: {m['map_id']}\n\n게임에서 기록 당시와 같은 경기 설정으로 싱글플레이를 시작하세요.\n초기 상태·틱·난수·체크섬이 다르면 재생을 중단합니다.\n현재는 경기 설정 자동 복원과 외부 PC 재생이 미지원입니다.")
+            self.work(run,done)
 
     def toggle_pin(self):
         item = self.selected()
@@ -164,6 +190,9 @@ class Launcher:
 
     def start_game(self):
         path = Path(self.game_path.get())
+        if self.record.get():
+            self.work(lambda:launch_engine(path,self.store),lambda pid:self.status.set(f'기록 엔진 연결 · PID {pid} · 싱글플레이 경기 종료 후 자동 저장'))
+            return
         def inspect():
             if path.name.lower() != 'kingdomunderfire.exe':
                 raise ValueError('KingdomUnderFire.exe를 선택하세요')
