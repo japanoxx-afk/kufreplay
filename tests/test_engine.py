@@ -27,6 +27,19 @@ def fixture(directory=b'res\\map\\Skirmish\\', name=b'fixture.kfm'):
             record(4,STATE.pack(1,1,1,107))+record(5,STATE.pack(2,1,1,110)))
 
 class EngineTests(unittest.TestCase):
+    def test_automatic_setup_versions_and_bounds(self):
+        raw=fixture();start=8+8+INITIAL_SIZE
+        old=struct.pack('<21I',1,0,1,0,0,*([0,0]+[1]*6),*([0,1]+[0]*6))
+        modern=struct.pack('<I',2)+old[4:]+bytes([1,1,0,1,1,0,0,0,1,0,0,0,0,0,0,0])
+        for setup in (old,modern):
+            self.assertEqual(parse_trace(raw[:start]+record(7,setup)+raw[start:]).setup,setup)
+        invalid=bytearray(modern);invalid[87]=255
+        for setup in (modern[:-1],bytes(invalid),struct.pack('<I',9)+old[4:]):
+            with self.assertRaises(ValueError):
+                parse_trace(raw[:start]+record(7,setup)+raw[start:])
+        with self.assertRaises(ValueError):
+            parse_trace(raw[:start]+record(7,old)+record(7,old)+raw[start:])
+
     def test_native_wire_layout(self):
         t=parse_trace(fixture())
         self.assertEqual(t.map_name,'fixture.kfm')

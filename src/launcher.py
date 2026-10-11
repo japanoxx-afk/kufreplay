@@ -25,7 +25,7 @@ class Launcher:
         outer = ttk.Frame(root, padding=18)
         outer.pack(fill='both', expand=True)
         ttk.Label(outer, text='KINGDOM UNDER FIRE · REPLAY', font=('Segoe UI', 18, 'bold')).pack(anchor='w')
-        ttk.Label(outer, text='실험용 엔진: 싱글플레이 · 재생 시 같은 지도/설정으로 경기 시작 필요 · 실경기 재현 검증 전', foreground='#b45309').pack(anchor='w', pady=(6, 14))
+        ttk.Label(outer, text='싱글플레이 자동 재생 · 관전자 시야(실험용) · 멀티플레이 미지원', foreground='#b45309').pack(anchor='w', pady=(6, 14))
         game = ttk.Frame(outer)
         game.pack(fill='x')
         self.game_path = tk.StringVar(value=self.store.config.get('game_path', str(DEFAULT_GAME)))
@@ -111,7 +111,7 @@ class Launcher:
         for p, m, pin in items:
             duration = m['ticks'] // m['tick_rate']
             time_text=f'{duration//60}:{duration%60:02d}' if m.get('duration_verified',True) else f"{m['ticks']}틱"
-            compat='실험용 · 같은 경기 설정 필요' if m['adapter_id']==ADAPTER else '호환 어댑터 없음'
+            compat='싱글 자동 재생 · 실험용' if m['adapter_id']==ADAPTER else '호환 어댑터 없음'
             if m.get('recovery'): compat='종료 누락 복구 · 마지막 배치 제외 · '+compat
             date_text=datetime.fromisoformat(m['recorded_at']).astimezone().strftime('%Y-%m-%d %H:%M:%S')
             row = self.tree.insert('', 'end', values=(date_text, m['map_id'], time_text, '★' if pin else '', compat))
@@ -136,8 +136,7 @@ class Launcher:
             def run():
                 return launch_engine(game,self.store,mode='steam-play',replay=p)
             def done(pid):
-                self.status.set(f'재생 엔진 연결 · PID {pid} · 게임에서 같은 지도/진영/슬롯/규칙으로 시작하세요.')
-                messagebox.showinfo('실험용 재생 준비', f"지도: {m['map_id']}\n\n게임에서 기록 당시와 같은 경기 설정으로 싱글플레이를 시작하세요.\n초기 상태·틱·난수·체크섬이 다르면 재생을 중단합니다.\n현재는 경기 설정 자동 복원과 외부 PC 재생이 미지원입니다.")
+                self.status.set(f"자동 경기 로딩 · PID {pid} · {m['map_id']} · 메뉴/지도 선택 없이 시작합니다.")
             self.work(run,done)
 
     def toggle_pin(self):

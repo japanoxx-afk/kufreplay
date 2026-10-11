@@ -23,6 +23,7 @@ MAGIC = b'KUFTRC01'
 MAX_TRACE = 128 * 1024 * 1024
 STATE = struct.Struct('<4I')
 INITIAL_SIZE = 664
+SETUP = struct.Struct('<21I')
 COMMAND = struct.Struct('<4I')
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ class Trace:
     final: tuple
     commands: int
     raw: bytes
+    setup: bytes | None = None
 
     @property
     def map_name(self):
@@ -46,6 +48,7 @@ def parse_trace(raw):
         raise ValueError('기록 크기 또는 형식 오류')
     offset, initial, pending, final = 8, None, None, None
     frames, commands, last_tick = [], 0, -1
+    setup = None
     while offset < len(raw):
         if offset + 8 > len(raw):
             raise ValueError('잘린 기록 헤더')
@@ -68,6 +71,13 @@ def parse_trace(raw):
                 if b'\0' not in segment:
                     raise ValueError('지도 문자열 종료 누락')
                 segment.split(b'\0')[0].decode('cp949')
+        elif kind == 7:
+            if initial is None or setup is not None or pending is not None or frames or length not in (SETUP.size, SETUP.size+16):
+                raise ValueError('자동 경기 설정 순서/크기 오류')
+            values=SETUP.unpack(payload[:SETUP.size])
+            if values[0] not in (1,2) or values[1:3] != (0,1) or values[3]>5 or values[4]>=8 or any(v>1 for v in values[5:13]) or any(v>3 for v in values[13:]) or values[5+values[4]]!=0 or (values[0]==2 and length!=100) or any(v>2 for v in payload[84:96]):
+                raise ValueError('지원하지 않는 자동 경기 설정')
+            setup=payload
         elif kind == 2:
             if initial is None or pending is not None or length != STATE.size:
                 raise ValueError('틱 시작 순서 오류')
@@ -104,7 +114,7 @@ def parse_trace(raw):
             raise ValueError('알 수 없는 기록 종류')
     if initial is None or final is None:
         raise ValueError('미완성 경기 기록')
-    return Trace(initial, tuple(frames), final, commands, raw)
+    return Trace(initial, tuple(frames), final, commands, raw, setup)
 
 def native_dir():
     if getattr(sys, 'frozen', False):
@@ -165,7 +175,9 @@ def package_capture(source, game, store, recovery=None):
                 'map_id':trace.map_name, 'ticks':max(1,trace.final[0]-trace.frames[0][0][0]+1),
                 'tick_rate':25, 'duration_verified':False, 'hashes':hashes,
                 'frame_count':len(trace.frames), 'command_count':trace.commands,
-                'initial_restore':'manual-identical-native-setup', 'multiplayer_supported':False}
+                'initial_restore':'automatic-native-setup' if trace.setup else 'verified-legacy-defaults',
+                'setup_version':struct.unpack_from('<I',trace.setup)[0] if trace.setup else 0,
+                'multiplayer_supported':False}
     if recovery:
         metadata['recovery']=recovery
     # Tick rate remains an estimate pending runtime measurement. UI does not show a false time.

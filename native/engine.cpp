@@ -22,9 +22,15 @@ constexpr uint32_t RingSize=16*1024*1024;
 unsigned char* ring=nullptr;
 DWORD producer=0;
 bool active=false,inDispatch=false;
+struct ReplayCommand { CommandHeader header; const unsigned char* bytes; };
+std::vector<ReplayCommand> replayBatch;
+size_t replayPop=0,replayApply=0;
 uint32_t session=0,frames=0;
 Initial initial{};
 State lastBefore{};
+Initial savedInitial{};
+MatchSetup savedSetup{};
+bool automaticStarted=false,hasSetup=false;
 std::vector<unsigned char> input,expectedText;
 size_t cursor=8;
 uintptr_t textBase=0;
@@ -47,7 +53,51 @@ Advance advance=nullptr;
 Apply apply=nullptr;
 Process process=nullptr;
 Process resultRender=nullptr;
+Process applicationProcess=nullptr;
+Process prepareDisplay=nullptr,drawDisplay=nullptr;
 Destroy destroy=nullptr;
+struct VisibilityBackup {unsigned char* object;unsigned char fog;};
+VisibilityBackup visibilityBackups[11264]{};
+unsigned visibilityCount=0,displayDepth=0;
+unsigned char savedFog=0;
+
+void enterObserverDisplay() {
+    if(displayDepth++) return;
+    savedFog=at<unsigned char>(0xb3ba61);visibilityCount=0;
+    void* manager=at<void*>(0xb870c0);
+    if(manager) {
+        auto bytes=(unsigned char*)manager;
+        uint32_t count=*(uint32_t*)(bytes+0xdc38),index=*(uint32_t*)(bytes+0xdc3c);
+        if(count>11264) return;
+        for(uint32_t i=0;i<count && index<11264;++i) {
+            auto unit=((unsigned char**)(bytes+0x2c38))[index];
+            if(unit) {
+                visibilityBackups[visibilityCount++]={unit,unit[0x6b]};
+                unit[0x6b]=0; // The native display-only fog cache (517560/496f26).
+            }
+            index=*(uint32_t*)(bytes+0xdc4c+index*12);
+        }
+    }
+    at<unsigned char>(0xb3ba61)=1;
+}
+
+void leaveObserverDisplay() {
+    if(--displayDepth) return;
+    for(unsigned i=0;i<visibilityCount;++i) visibilityBackups[i].object[0x6b]=visibilityBackups[i].fog;
+    visibilityCount=0;at<unsigned char>(0xb3ba61)=savedFog;
+}
+
+uint32_t observerDisplay(void* self,Process original) {
+    if(!playback || !active || inDispatch || GetCurrentThreadId()!=producer) return original(self);
+    uint32_t result=0;
+    __try {enterObserverDisplay();result=original(self);}
+    __finally {leaveObserverDisplay();}
+    return result;
+}
+uint32_t __fastcall prepareDisplayHook(void* self,void*) {return observerDisplay(self,prepareDisplay);}
+uint32_t __fastcall drawDisplayHook(void* self,void*) {return observerDisplay(self,drawDisplay);}
+uint32_t __fastcall observerInputOne(void*,void*,uint32_t) {return 0;}
+uint32_t __fastcall observerInputTwo(void*,void*,uint32_t,uint32_t) {return 0;}
 
 struct Patch {unsigned char* p;std::vector<unsigned char> before,after;};
 std::vector<Patch> patches;
@@ -134,6 +184,83 @@ void fillInitial(void* self,Initial& value) {
     for(uint32_t i=0;i<11;++i) memcpy(value.slots[i],address(0xb83cdc+i*0x40c),12);
 }
 
+bool validSetup(const MatchSetup& setup) {
+    if((setup.version!=1 && setup.version!=2) || setup.scenarioMode!=0 || setup.rtsMode!=1 || setup.gameType>5 || setup.localPlayer>=8) return false;
+    for(unsigned i=0;i<8;++i) if(setup.players[i]>1 || setup.resources[i]>3) return false;
+    for(unsigned i=0;i<12;++i) if(setup.nativeOptions[i]>2) return false;
+    return setup.players[setup.localPlayer]==0;
+}
+
+void captureSetup(void* self,MatchSetup& setup) {
+    setup={};setup.version=2;setup.scenarioMode=at<uint16_t>(0xb83ad2);
+    setup.rtsMode=at<unsigned char>(0xb83ad4);setup.gameType=at<uint32_t>(0xbecd74);
+    setup.localPlayer=*(uint32_t*)((unsigned char*)self+0x664);
+    memcpy(setup.players,address(0xbecd78),sizeof(setup.players));
+    memcpy(setup.resources,address(0xbecd98),sizeof(setup.resources));
+    memcpy(setup.nativeOptions,(unsigned char*)self+0xc78,sizeof(setup.nativeOptions));
+}
+
+void legacyOptions(MatchSetup& setup) {
+    // Standard custom-game options used by the native profile setup. Legacy
+    // archives are accepted only if the original state/RNG checks also match.
+    const unsigned char defaults[16]={1,1,0,1,1,0,0,0,1,0,0,0,0,0,0,0};
+    memcpy(setup.nativeOptions,defaults,sizeof(defaults));
+}
+
+void restore();
+void showPlaybackNotice();
+
+uint32_t __fastcall applicationHook(void* self,void*) {
+    if(playback && terminal.load() && !at<void*>(0xb8282c)) {
+        showPlaybackNotice();return applicationProcess(self);
+    }
+    // 19 is the initialized main menu, measured in this exact Steam build.
+    // Invoke the same viewport/loading and state transitions used by custom-game OK.
+    if(playback && !automaticStarted && !failed.load() && *(uint32_t*)((unsigned char*)self+0x128)==19) {
+        automaticStarted=true;
+        memcpy(address(0xb83ad9),savedInitial.directory,256);
+        memcpy(address(0xb83bd9),savedInitial.map,256);
+        if(!hasSetup) {
+            // Old archives lack menu settings. Infer the bounded default custom setup;
+            // the original complete Initial comparison still refuses any mismatch.
+            savedSetup={};savedSetup.version=1;savedSetup.rtsMode=1;
+            legacyOptions(savedSetup);
+            std::string filename=savedInitial.directory;filename+=savedInitial.map;
+            HANDLE f=CreateFileA(filename.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr);
+            unsigned char header[108]{};DWORD count=0;
+            bool ok=f!=INVALID_HANDLE_VALUE && ReadFile(f,header,sizeof(header),&count,nullptr) && count==sizeof(header);
+            if(f!=INVALID_HANDLE_VALUE) CloseHandle(f);
+            uint32_t players=0;if(ok) memcpy(&players,header+0x2c,4);
+            if(!ok || memcmp(header,"KUF Map File v0.67",17) || players<1 || players>8) {invalidate(13);return applicationProcess(self);}
+            for(unsigned i=0;i<8;++i) {
+                savedSetup.players[i]=i<players?0:1;
+                uint32_t value=savedInitial.slots[i][1];
+                savedSetup.resources[i]=value==2000?1:value==4000?2:value==3000?3:0;
+                if(savedInitial.slots[i][0]==1) savedSetup.localPlayer=i;
+            }
+        }
+        if(!validSetup(savedSetup)) {invalidate(13);return applicationProcess(self);}
+        at<unsigned char>(0xb83ad0)=0;at<uint16_t>(0xb83ad2)=0;at<unsigned char>(0xb83ad4)=1;
+        at<unsigned char>(0xb83cd9)=0;at<unsigned char>(0xbececb)=0;at<unsigned char>(0xbecfd4)=0;
+        at<uint32_t>(0xbecd74)=savedSetup.gameType;
+        memcpy(address(0xbecd78),savedSetup.players,sizeof(savedSetup.players));
+        memcpy(address(0xbecd98),savedSetup.resources,sizeof(savedSetup.resources));
+        memcpy(address(0xbeda08),savedSetup.nativeOptions,sizeof(savedSetup.nativeOptions));
+        at<unsigned char>(0xbed0dc)=0;
+        using GameKind=int(__thiscall*)(void*);
+        int kind=reinterpret_cast<GameKind>(address(0x58e1e0))(self);
+        if(kind<0 || kind>6) {invalidate(13);return applicationProcess(self);}
+        using Viewport=void(__thiscall*)(void*,int,bool,bool);
+        reinterpret_cast<Viewport>(address(0x598900))(self,kind,true,at<unsigned char>(0xb41727)!=0);
+        void* world=at<void*>(0xb82808);
+        if(world) *((unsigned char*)world+0x7f)=1;
+        using ChangeState=void(__thiscall*)(void*,uint32_t);
+        reinterpret_cast<ChangeState>(address(0x598820))(self,3);
+        log("Automatic replay map/setup loading started.");
+    }
+    return applicationProcess(self);
+}
+
 LRESULT CALLBACK recordingWindowProc(HWND window,UINT message,WPARAM wparam,LPARAM lparam) {
     if(message==RecordPulse) {
         // Custom-game quit returns the map directory to the menu directory while
@@ -162,6 +289,14 @@ BOOL CALLBACK findGameWindow(HWND window,LPARAM) {
 }
 
 uint32_t __fastcall commandHook(void* self,void*,uint32_t length,const void* bytes) {
+    if(playback && inDispatch) {
+        if(failed.load() || replayApply>=replayBatch.size()) {invalidate(8);return 0;}
+        const auto& command=replayBatch[replayApply++];
+        const auto& h=command.header;
+        if(length!=h.size || memcmp(bytes,command.bytes,length) ||
+           h.tick!=at<uint32_t>(0xb8a280) || h.seed!=at<uint32_t>(0xbed1e8) ||
+           h.randomCount!=at<uint32_t>(0xb827dc)) {invalidate(8);return 0;}
+    }
     if(active && inDispatch && !playback && !failed.load()) {
         if(length<2 || length>MaxCommand) invalidate(4);
         else {
@@ -172,6 +307,28 @@ uint32_t __fastcall commandHook(void* self,void*,uint32_t length,const void* byt
         }
     }
     return apply(self,length,bytes);
+}
+
+uint32_t __fastcall replayQueueCount(void*,void*) {return static_cast<uint32_t>(replayBatch.size()-replayPop);}
+uint32_t __fastcall replayQueuePop(void*,void*,void* bytes,uint32_t* metadata) {
+    if(replayPop>=replayBatch.size()) {invalidate(8);return 0;}
+    const auto& command=replayBatch[replayPop++];
+    memcpy(bytes,command.bytes,command.header.size);*metadata=0;return command.header.size;
+}
+
+uint32_t dispatchReplay(void* self,uint32_t a,uint32_t b) {
+    void* queue=at<void*>(0xb870c8);
+    void*** object=reinterpret_cast<void***>(queue);
+    void** original=*object;void* replacement[12];
+    memcpy(replacement,original,sizeof(replacement));
+    replacement[2]=(void*)replayQueuePop;replacement[4]=(void*)replayQueueCount;
+    replayPop=0;replayApply=0;inDispatch=true;
+    uint32_t result=1;
+    // Preserve native command batching, bookkeeping and AI updates. Restore even on SEH.
+    __try {*object=replacement;result=advance(self,a,b);}
+    __finally {*object=original;inDispatch=false;}
+    if(replayPop!=replayBatch.size() || replayApply!=replayBatch.size()) invalidate(8);
+    return result;
 }
 
 bool discardLiveQueue() {
@@ -210,10 +367,15 @@ uint32_t __fastcall advanceHook(void* self,void*,uint32_t a,uint32_t b) {
             const unsigned char* p;uint32_t n;
             if(!getRecord(Begin,p,n) || n!=sizeof(Initial)) {invalidate(6);return 1;}
             const Initial* saved=reinterpret_cast<const Initial*>(p);
-            // This prototype requires the same game-native match setup to have been loaded.
+            // Automatic bootstrap must produce the original game-native initial state.
             // It never overwrites arbitrary state or RNG to conceal a mismatch.
             if(memcmp(saved,&initial,sizeof(Initial))) {invalidate(7);return 1;}
-        } else emit(Begin,&initial,sizeof(initial));
+            if(nextKind(Setup) && (!getRecord(Setup,p,n) || (n!=84 && n!=sizeof(MatchSetup)))) {invalidate(6);return 1;}
+        } else {
+            MatchSetup setup{};captureSetup(self,setup);
+            emit(Begin,&initial,sizeof(initial));
+            if(validSetup(setup)) emit(Setup,&setup,sizeof(setup));
+        }
         active=true;++session;frames=0;
     }
     if(!playback) {
@@ -233,17 +395,17 @@ uint32_t __fastcall advanceHook(void* self,void*,uint32_t a,uint32_t b) {
     }
     if(!getRecord(Before,p,n) || n!=sizeof(State) || !same(state,*reinterpret_cast<const State*>(p))) {invalidate(8);return 1;}
     if(!discardLiveQueue()) {invalidate(9);return 1;}
+    replayBatch.clear();
     while(nextKind(Command)) {
         if(!getRecord(Command,p,n) || n<sizeof(CommandHeader)) {invalidate(6);return 1;}
         const CommandHeader* h=reinterpret_cast<const CommandHeader*>(p);
-        if(h->size<2 || h->size>MaxCommand || n!=sizeof(*h)+h->size ||
-           h->tick!=at<uint32_t>(0xb8a280) || h->seed!=at<uint32_t>(0xbed1e8) || h->randomCount!=at<uint32_t>(0xb827dc)) {invalidate(8);return 1;}
-        // Pad the native decoder's fixed stack-sized input. Inputs are locally authenticated by launcher.
-        unsigned char safe[MaxCommand]{};memcpy(safe,p+sizeof(*h),h->size);
-        apply(self,h->size,safe);
+        if(h->size<2 || h->size>MaxCommand || n!=sizeof(*h)+h->size || replayBatch.size()>=4096) {invalidate(6);return 1;}
+        replayBatch.push_back({*h,p+sizeof(*h)});
     }
+    uint32_t result=dispatchReplay(self,a,b);
+    if(failed.load()) return 1;
     if(!snapshot(self,state) || !getRecord(After,p,n) || n!=sizeof(State) || !same(state,*reinterpret_cast<const State*>(p))) {invalidate(8);return 1;}
-    ++frames;return 1;
+    ++frames;return result;
 }
 
 uint32_t __fastcall destroyHook(void* self,void*,uint32_t flags) {
@@ -277,16 +439,21 @@ void restore() {
     ReleaseSRWLockExclusive(&codeLock);
 }
 
-uint32_t __fastcall processHook(void* self,void*) {
-    if(playback && terminal.load()) {
+void showPlaybackNotice() {
         static bool shown=false;
         if(!shown) {
             shown=true;
-            const wchar_t* prompt=failed.load()?L"기록 상태와 다른 상태를 발견해 재생을 중단했습니다. 종료하시겠습니까?":L"재생이 끝났습니다. 종료하시겠습니까?";
+            const wchar_t* prompt=notice.load()==13?L"이 기록의 지도 또는 경기 설정을 자동으로 복원할 수 없습니다. 최신 런처로 새 경기를 기록해 주세요. 종료하시겠습니까?":
+                failed.load()?L"기록 상태와 다른 상태를 발견해 재생을 중단했습니다. 종료하시겠습니까?":L"재생이 끝났습니다. 종료하시겠습니까?";
             if(MessageBoxW(GetActiveWindow(),prompt,L"KUF Replay",MB_YESNO|MB_ICONQUESTION)==IDYES) {
                 restore();PostQuitMessage(0);
             }
         }
+}
+
+uint32_t __fastcall processHook(void* self,void*) {
+    if(playback && terminal.load()) {
+        showPlaybackNotice();
         return 1;
     }
     return process(self);
@@ -367,7 +534,20 @@ bool readInput(const wchar_t* path) {
     if(length.QuadPart<8 || length.QuadPart>MaxFile) {CloseHandle(f);return false;}
     input.resize((size_t)length.QuadPart);DWORD count=0;
     bool ok=ReadFile(f,input.data(),(DWORD)input.size(),&count,nullptr) && count==input.size() && !memcmp(input.data(),Magic,8);
-    CloseHandle(f);return ok;
+    CloseHandle(f);
+    if(ok) {
+        const unsigned char* p;uint32_t size;
+        if(!getRecord(Begin,p,size) || size!=sizeof(savedInitial)) return false;
+        memcpy(&savedInitial,p,size);
+        if(nextKind(Setup)) {
+            if(!getRecord(Setup,p,size) || (size!=84 && size!=sizeof(savedSetup))) return false;
+            memcpy(&savedSetup,p,size);if(size==84) legacyOptions(savedSetup);
+            hasSetup=validSetup(savedSetup);if(!hasSetup) return false;
+        }
+        if(!memchr(savedInitial.directory,0,256) || !memchr(savedInitial.map,0,256) || savedInitial.networkMode) return false;
+        cursor=8;
+    }
+    return ok;
 }
 
 DWORD WINAPI worker(void* argument) {
@@ -429,6 +609,20 @@ DWORD WINAPI worker(void* argument) {
         if(ok) {process=reinterpret_cast<Process>(patchEntry(0x4cf2b0,procPrefix,sizeof(procPrefix),(void*)processHook));ok=process!=nullptr;}
         if(ok) {destroy=reinterpret_cast<Destroy>(patchEntry(0x4c09f0,destroyPrefix,sizeof(destroyPrefix),(void*)destroyHook));ok=destroy!=nullptr;}
         if(ok) {resultRender=reinterpret_cast<Process>(patchEntry(0x7245d0,procPrefix,sizeof(procPrefix),(void*)resultRenderHook));ok=resultRender!=nullptr;}
+        if(ok && playback) {applicationProcess=reinterpret_cast<Process>(address(0x593f80));ok=patchCall(0x4fee4b,0x593f80,(void*)applicationHook);}
+        if(ok && playback) {
+            unsigned char renderPrefix[]={0x56,0x57,0x8b,0x3d,0,0,0,0};
+            uint32_t timer=static_cast<uint32_t>((uintptr_t)address(0xa16cfc));memcpy(renderPrefix+4,&timer,4);
+            prepareDisplay=reinterpret_cast<Process>(patchEntry(0x4c6a70,renderPrefix,sizeof(renderPrefix),(void*)prepareDisplayHook));ok=prepareDisplay!=nullptr;
+            const unsigned char drawPrefix[]={0x55,0x8b,0xec,0x83,0xec,0x54};
+            if(ok) {drawDisplay=reinterpret_cast<Process>(patchEntry(0x4ced30,drawPrefix,sizeof(drawPrefix),(void*)drawDisplayHook));ok=drawDisplay!=nullptr;}
+            // These four native input senders already return without dispatch in
+            // the game's own playback mode. Camera processing is left intact.
+            unsigned char inputPrefix[]={0x55,0x8b,0xec,0x80,0x3d,0,0,0,0,0x01};
+            uint32_t flag=static_cast<uint32_t>((uintptr_t)address(0xb83ad8));memcpy(inputPrefix+5,&flag,4);
+            const uint32_t senders[]={0x5259e0,0x525a10,0x525a30,0x525a50};
+            for(unsigned i=0;i<4 && ok;++i) ok=patchEntry(senders[i],inputPrefix,sizeof(inputPrefix),i?(void*)observerInputTwo:(void*)observerInputOne)!=nullptr;
+        }
     }
     if(!ok) {restore();log("Initialization failed; all installed owned patches restored.");}
     for(auto h:paused) {ResumeThread(h);CloseHandle(h);}
@@ -438,7 +632,7 @@ DWORD WINAPI worker(void* argument) {
     else GetEnvironmentVariableW(L"KUF_REPLAY_READY",buffer,32768);
     HANDLE event=OpenEventW(EVENT_MODIFY_STATE,FALSE,buffer);if(event) {SetEvent(event);CloseHandle(event);}
     if(!ok) return 1;
-    log(playback?"Playback adapter ready. Waiting for identical game-native match setup.":"Recording adapter ready. Single-player only; multiplayer intentionally excluded.");
+    log(playback?"Playback adapter ready. Automatic custom-game setup and spectator display enabled.":"Recording adapter ready. Single-player only; multiplayer intentionally excluded.");
     HANDLE file=INVALID_HANDLE_VALUE;std::wstring partial;uint32_t fileBytes=0,number=0;
     uint32_t lastFrameOffset=0,writtenFrames=0;State writerBefore{};
     ULONGLONG checkAt=GetTickCount64(),pulseAt=0;int lastNotice=0;

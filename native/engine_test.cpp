@@ -15,12 +15,33 @@ uint32_t __fastcall fakeApply(void*,void*,uint32_t n,const void* bytes) {
     ++at<uint32_t>(0xb827dc);++applied;return 1;
 }
 uint32_t __fastcall fakeAdvance(void* self,void*,uint32_t,uint32_t) {
+    if(playback) {
+        void* queue=at<void*>(0xb870c8);void** table=*reinterpret_cast<void***>(queue);
+        using Count=uint32_t(__thiscall*)(void*);using Pop=uint32_t(__thiscall*)(void*,void*,uint32_t*);
+        while(reinterpret_cast<Count>(table[4])(queue)) {
+            unsigned char bytes[MaxCommand]{};uint32_t metadata=0;
+            uint32_t n=reinterpret_cast<Pop>(table[2])(queue,bytes,&metadata);
+            commandHook(self,nullptr,n,bytes);
+        }
+        return 1;
+    }
     const uint32_t commands[]={5,9};
     for(auto command:commands) commandHook(self,nullptr,4,&command);
     return 1;
 }
 uint32_t __fastcall fakeCount(void*,void*) {return queueCount;}
 uint32_t __fastcall fakeResultRender(void*,void*) {return 123;}
+uint32_t __fastcall fakeObserverDraw(void* self,void*) {
+    if(at<unsigned char>(0xb3ba61)!=1 || ((unsigned char*)self)[0x6b]!=0) exit(2);
+    ((unsigned char*)self)[0x6b]=7;return 321;
+}
+uint32_t __fastcall fakeObserverThrow(void*,void*) {RaiseException(0xe0000123,0,0,nullptr);return 0;}
+bool observerExceptionRestored(void* self) {
+    bool caught=false;
+    __try {observerDisplay(self,reinterpret_cast<Process>(fakeObserverThrow));}
+    __except(GetExceptionCode()==0xe0000123?EXCEPTION_EXECUTE_HANDLER:EXCEPTION_CONTINUE_SEARCH) {caught=true;}
+    return caught && ((unsigned char*)self)[0x6b]==1 && at<unsigned char>(0xb3ba61)==0 && displayDepth==0;
+}
 uint32_t __fastcall fakePop(void*,void*,void*,uint32_t*) {--queueCount;return 4;}
 void resetState() {
     closePending.store(false);closeReady.store(false);
@@ -42,11 +63,11 @@ int main() {
     // The checksum call target is a five-byte tail jump to a fixture function with the same ECX ABI.
     auto code=(unsigned char*)address(0x4dae50);code[0]=0xe9;
     int32_t delta=(int32_t)((uintptr_t)fakeChecksum-(uintptr_t)code-5);memcpy(code+1,&delta,4);
-    int self=1;
+    unsigned char self[0xcb0]{};
     at<void*>(0xb870c0)=&self;
     strcpy_s((char*)address(0xb83ad9),256,"res\\map\\Skirmish\\");
     strcpy_s((char*)address(0xb83bd9),256,"fixture.kfm");
-    void* vtable[5]{};vtable[2]=(void*)fakePop;vtable[4]=(void*)fakeCount;
+    void* vtable[12]{};vtable[2]=(void*)fakePop;vtable[4]=(void*)fakeCount;
     void** queue=vtable;at<void*>(0xb870c8)=&queue;
     apply=reinterpret_cast<Apply>(fakeApply);advance=reinterpret_cast<Advance>(fakeAdvance);
     resetState();playback=false;
@@ -59,6 +80,15 @@ int main() {
     advanceHook(&self,nullptr,0,0);require(!failed.load() && queueCount==0,"discard spectator/live commands");
     simulate();advanceHook(&self,nullptr,0,0);simulate();advanceHook(&self,nullptr,0,0);
     require(terminal.load() && !failed.load() && notice.load()==10 && applied==4 && resource==134,"identical state and completed replay");
+    require(queue==vtable,"native dispatch restores the original queue vtable");
+    auto manager=(unsigned char*)address(0x600000);memset(manager,0,0x40000);
+    *(uint32_t*)(manager+0xdc38)=1;*(uint32_t*)(manager+0xdc3c)=0;
+    ((unsigned char**)(manager+0x2c38))[0]=self;at<void*>(0xb870c0)=manager;
+    self[0x6b]=1;at<unsigned char>(0xb3ba61)=0;active=true;
+    require(observerDisplay(self,reinterpret_cast<Process>(fakeObserverDraw))==321,"spectator display uses complete terrain and unit fog cache");
+    require(self[0x6b]==1 && at<unsigned char>(0xb3ba61)==0 && displayDepth==0,"spectator display restores original fog state after callback");
+    require(observerExceptionRestored(self),"spectator display restores original fog state on an exception");
+    active=false;at<void*>(0xb870c0)=&self;
     resetState();at<uint32_t>(0xbed1e8)=9;advanceHook(&self,nullptr,0,0);
     require(failed.load() && notice.load()==7 && applied==0,"reject mismatched initial RNG before injection");
     resetState();advanceHook(&self,nullptr,0,0);simulate();++resource;advanceHook(&self,nullptr,0,0);

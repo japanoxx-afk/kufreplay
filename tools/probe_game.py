@@ -41,6 +41,26 @@ def probe(pid):
         return out.raw
     try:
         result={'module_base':hex(base)}
+        app=int.from_bytes(read(0xbea7e8),'little')
+        if app:
+            def pointer_value(pointer,size=4):
+                out=c.create_string_buffer(size); n=c.c_size_t()
+                if not k.ReadProcessMemory(h,pointer,out,size,c.byref(n)) or n.value!=size:
+                    raise c.WinError(c.get_last_error())
+                return int.from_bytes(out.raw,'little')
+            result['application']=hex(app)
+            result['application_state']=pointer_value(app+0x128)
+        result['scenario_mode']=int.from_bytes(read(0xb83ad2,2),'little')
+        result['rts_mode']=int.from_bytes(read(0xb83ad4,1),'little')
+        result['participant_count']=int.from_bytes(read(0xb83ad6,2),'little')
+        result['custom_players']=[int.from_bytes(read(0xbecd78+i*4),'little') for i in range(8)]
+        result['custom_resources']=[int.from_bytes(read(0xbecd98+i*4),'little') for i in range(8)]
+        result['custom_game_type']=int.from_bytes(read(0xbecd74),'little')
+        result['native_options']=list(read(0xbeda08,16))
+        obj=int.from_bytes(read(0xb8282c),'little')
+        if obj:
+            result['match_options']=[pointer_value(obj+0xc7a+i,1) for i in range(10)]
+            result['match_seed']=pointer_value(obj+0xc84)
         for name,va,size in [('tick',0xb8a280,4),('seed',0xbed1e8,4),('rng_count',0xb827dc,4),
                              ('game_object',0xb8282c,4),('network_mode',0xb83ad0,1),
                              ('playback_flag',0xb83ad8,1),('record_flag',0xbea2a3,1),
