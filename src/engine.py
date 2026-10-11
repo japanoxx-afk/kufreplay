@@ -8,6 +8,9 @@ import subprocess
 import sys
 import uuid
 import zipfile
+import ctypes
+import re
+import msvcrt
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -139,7 +142,7 @@ def resolve_map(game, trace):
         raise ValueError('설치 폴더 안에서 기록한 .kfm 지도를 찾지 못했습니다')
     return candidate
 
-def package_capture(source, game, store):
+def package_capture(source, game, store, recovery=None):
     source = Path(source)
     if source.stat().st_size > MAX_TRACE:
         raise ValueError('기록 크기 제한 초과')
@@ -163,6 +166,8 @@ def package_capture(source, game, store):
                 'tick_rate':25, 'duration_verified':False, 'hashes':hashes,
                 'frame_count':len(trace.frames), 'command_count':trace.commands,
                 'initial_restore':'manual-identical-native-setup', 'multiplayer_supported':False}
+    if recovery:
+        metadata['recovery']=recovery
     # Tick rate remains an estimate pending runtime measurement. UI does not show a false time.
     metadata['local_signature'] = _signature(_key(store.root,create=True),metadata)
     temp = store.root / (uuid.uuid4().hex+'.partial')
@@ -177,6 +182,44 @@ def package_capture(source, game, store):
         return result
     finally:
         temp.unlink(missing_ok=True)
+
+def recover_closed_capture(source, game, store):
+    """Recover a structurally complete prefix; preserve the original unfinished trace."""
+    source=Path(source)
+    if source.stat().st_size>MAX_TRACE:
+        raise ValueError('기록 크기 제한 초과')
+    raw=source.read_bytes()
+    offset=8;last_before=None;last_after=None;complete_end=0;complete_before=None
+    while offset<len(raw):
+        if offset+8>len(raw): break
+        kind,length=struct.unpack_from('<2I',raw,offset)
+        if length>4096: raise ValueError('기록 크기 오류')
+        if offset+8+length>len(raw): break
+        if kind==5: raise ValueError('이미 마감된 기록입니다')
+        if kind==2 and length==STATE.size:
+            last_before=(offset,raw[offset+8:offset+8+length])
+        if kind==4 and length==STATE.size:
+            last_after=raw[offset+8:offset+8+length]
+            complete_end=offset+8+length;complete_before=last_before
+        offset+=8+length
+    if complete_before is None or last_after is None: raise ValueError('복구 가능한 경기 경계 없음')
+    # Ignore only the torn final write; validate every complete record in the prefix.
+    original=parse_trace(raw[:complete_end]+struct.pack('<2I',5,STATE.size)+last_after)
+    if len(original.frames)<2: raise ValueError('기록이 너무 짧아 복구할 수 없습니다')
+    recovered=raw[:complete_before[0]]+struct.pack('<2I',5,STATE.size)+complete_before[1]
+    trace=parse_trace(recovered)
+    staging=store.root/'Recovery';staging.mkdir(parents=True,exist_ok=True)
+    temporary=staging/(uuid.uuid4().hex+'.complete')
+    temporary.write_bytes(recovered)
+    os.utime(temporary,(source.stat().st_atime,source.stat().st_mtime))
+    try:
+        return package_capture(temporary,game,store,recovery={
+            'reason':'missing-end-record', 'source':source.name,
+            'discarded_batches':1, 'discarded_commands':original.commands-trace.commands,
+            'truncated_tail_bytes':len(raw)-complete_end,
+            'final_tick':trace.final[0]})
+    finally:
+        temporary.unlink(missing_ok=True)
 
 def stage_playback(path, game, store):
     m = validate(path)
@@ -225,12 +268,14 @@ def launch_engine(game, store, mode='record', replay=None):
     if not helper.exists() or not dll.exists():
         raise ValueError('네이티브 엔진 파일이 없습니다. native/build.cmd를 빌드하세요.')
     staged=None
-    if mode=='play':
+    if mode in ('play','steam-play'):
         staged,_=stage_playback(replay,game,store)
     try:
         result=subprocess.run([str(helper),str(game),str(dll),str(store.root),mode,str(staged or '-')],
-                              capture_output=True,text=True,timeout=100 if mode=='steam-record' else 40,creationflags=subprocess.CREATE_NO_WINDOW)
+                              capture_output=True,text=True,timeout=100 if mode.startswith('steam-') else 40,creationflags=subprocess.CREATE_NO_WINDOW)
         if result.returncode:
+            if result.returncode==4:
+                raise ValueError('게임이 아직 실행 중입니다. 기존 게임 창을 정상적으로 닫고 다시 실행/재생하세요. 진행 중인 경기는 자동으로 종료하지 않습니다.')
             raise ValueError(result.stderr.strip() or '엔진 초기화 실패: engine.log 확인')
         return int(result.stdout.strip())
     finally:
@@ -239,7 +284,22 @@ def launch_engine(game, store, mode='record', replay=None):
             staged.unlink(missing_ok=True)
 
 def collect_completed(game, store):
+    # Multiple launcher windows must not package the same capture concurrently.
+    with (store.root/'.capture-collect.lock').open('a+b') as lock:
+        if lock.tell()==0: lock.write(b'0');lock.flush()
+        lock.seek(0)
+        try:
+            msvcrt.locking(lock.fileno(),msvcrt.LK_NBLCK,1)
+        except OSError:
+            return [],[]
+        try:
+            return _collect_completed(game,store)
+        finally:
+            lock.seek(0);msvcrt.locking(lock.fileno(),msvcrt.LK_UNLCK,1)
+
+def _collect_completed(game, store):
     result, errors=[], []
+    recovered_sources={m.get('recovery',{}).get('source') for _,m,_ in store.listing()}
     for source in (store.root/'CaptureInbox').glob('*.partial.complete'):
         try:
             result.append(package_capture(source,game,store))
@@ -248,4 +308,39 @@ def collect_completed(game, store):
             source.rename(rejected)
             atomic_json(rejected.with_suffix(rejected.suffix+'.json'),{'error':str(error)})
             errors.append(str(error))
+    for source in (store.root/'CaptureInbox').glob('*.partial'):
+        match=re.fullmatch(r'(\d+)_\d+\.partial',source.name)
+        if not match or process_alive(int(match[1])):
+            continue
+        if source.name in recovered_sources:
+            source.rename(source.with_suffix('.partial.recovered'))
+            continue
+        try:
+            if source.stat().st_size>MAX_TRACE: raise ValueError('기록 크기 제한 초과')
+            try:
+                parse_trace(source.read_bytes())
+            except ValueError:
+                result.append(recover_closed_capture(source,game,store))
+                source.rename(source.with_suffix('.partial.recovered'))
+            else:
+                result.append(package_capture(source,game,store))
+        except (ValueError,OSError,UnicodeError,zipfile.BadZipFile) as error:
+            rejected=source.with_suffix('.partial.rejected')
+            source.rename(rejected)
+            atomic_json(rejected.with_suffix(rejected.suffix+'.json'),{'error':str(error)})
+            errors.append(str(error))
     return result, errors
+
+def process_alive(pid):
+    kernel=ctypes.WinDLL('kernel32',use_last_error=True)
+    kernel.OpenProcess.argtypes=[ctypes.c_uint32,ctypes.c_int,ctypes.c_uint32]
+    kernel.OpenProcess.restype=ctypes.c_void_p
+    kernel.WaitForSingleObject.argtypes=[ctypes.c_void_p,ctypes.c_uint32]
+    kernel.CloseHandle.argtypes=[ctypes.c_void_p]
+    handle=kernel.OpenProcess(0x100000,False,pid)
+    if not handle:
+        return ctypes.get_last_error()!=87  # Access denied/unknown is not evidence of exit.
+    try:
+        return kernel.WaitForSingleObject(handle,0)!=0
+    finally:
+        kernel.CloseHandle(handle)

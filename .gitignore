@@ -1,4 +1,6 @@
 __pycache__/
+KUFReplayLauncher.exe
+KUFReplayLauncher.exe.sha256
 *.pyc
 build/
 dist/

@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
 from engine import (MAGIC, STATE, INITIAL_SIZE, parse_trace, resolve_map, package_capture,
-                    stage_playback, collect_completed, ADAPTER)
+                    stage_playback, collect_completed, recover_closed_capture, ADAPTER)
 from replay_store import Store, validate
 
 def record(kind, payload):
@@ -119,6 +119,49 @@ class EngineTests(unittest.TestCase):
             self.assertFalse(source.exists())
             self.assertTrue(list(inbox.glob('*.rejected')))
             self.assertEqual(collect_completed('unused',store),([],[]))
+
+    def test_recover_closed_prefix_preserves_source_and_cutoff_state(self):
+        with tempfile.TemporaryDirectory() as root:
+            root=Path(root);game=root/'game'/'KingdomUnderFire.exe'
+            game.parent.mkdir();game.write_bytes(b'fixture-executable')
+            maps=game.parent/'res'/'map'/'Skirmish';maps.mkdir(parents=True)
+            (maps/'fixture.kfm').write_bytes(b'fixture-map-data')
+            source=root/'ended.partial'
+            second=(2,1,1,110)
+            raw=fixture()[:-24]+record(2,STATE.pack(*second))+record(4,STATE.pack(*second))
+            source.write_bytes(raw)
+            store=Store(root/'store')
+            with patch('engine.GAME_HASH',hashlib.sha256(game.read_bytes()).hexdigest()):
+                replay=recover_closed_capture(source,game,store)
+            self.assertEqual(source.read_bytes(),raw)
+            metadata=validate(replay)
+            self.assertEqual(metadata['recovery']['discarded_batches'],1)
+            with zipfile.ZipFile(replay) as z: trace=parse_trace(z.read('commands.bin'))
+            self.assertEqual(len(trace.frames),1)
+            self.assertEqual(trace.final,second)
+            self.assertEqual(trace.commands,1)
+            source.write_bytes(raw[:-1])
+            with self.assertRaises(ValueError): recover_closed_capture(source,game,store)
+
+    def test_orphan_recovery_waits_for_process_exit_and_handles_torn_tail(self):
+        with tempfile.TemporaryDirectory() as root:
+            root=Path(root);game=root/'game'/'KingdomUnderFire.exe'
+            game.parent.mkdir();game.write_bytes(b'fixture-executable')
+            maps=game.parent/'res'/'map'/'Skirmish';maps.mkdir(parents=True)
+            (maps/'fixture.kfm').write_bytes(b'fixture-map-data')
+            store=Store(root/'store');inbox=store.root/'CaptureInbox';inbox.mkdir()
+            source=inbox/'54321_1.partial';second=(2,1,1,110)
+            source.write_bytes(fixture()[:-24]+record(2,STATE.pack(*second))+record(4,STATE.pack(*second))+struct.pack('<2I',2,16)+b'xx')
+            with patch('engine.GAME_HASH',hashlib.sha256(game.read_bytes()).hexdigest()):
+                with patch('engine.process_alive',return_value=True):
+                    self.assertEqual(collect_completed(game,store),([],[]))
+                    self.assertTrue(source.exists())
+                with patch('engine.process_alive',return_value=False):
+                    completed,errors=collect_completed(game,store)
+                    self.assertEqual(errors,[]);self.assertEqual(len(completed),1)
+                    self.assertEqual(validate(completed[0])['recovery']['truncated_tail_bytes'],10)
+                    self.assertTrue(source.with_suffix('.partial.recovered').exists())
+                    self.assertEqual(collect_completed(game,store),([],[]))
 
 if __name__=='__main__':
     unittest.main()

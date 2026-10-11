@@ -24,6 +24,7 @@ DWORD producer=0;
 bool active=false,inDispatch=false;
 uint32_t session=0,frames=0;
 Initial initial{};
+State lastBefore{};
 std::vector<unsigned char> input,expectedText;
 size_t cursor=8;
 uintptr_t textBase=0;
@@ -33,6 +34,8 @@ std::atomic<int> notice{0};
 HWND gameWindow=nullptr;
 WNDPROC oldWindowProc=nullptr;
 std::atomic<bool> closePending{false},closeReady{false};
+constexpr UINT RecordPulse=WM_APP+0x4b1;
+std::atomic<ULONGLONG> lastAdvanceAt{0};
 
 template<class T> T& at(uint32_t va) {return *reinterpret_cast<T*>(base+va-0x400000);}
 void* address(uint32_t va) {return reinterpret_cast<void*>(base+va-0x400000);}
@@ -43,6 +46,7 @@ using Destroy=uint32_t(__thiscall*)(void*,uint32_t);
 Advance advance=nullptr;
 Apply apply=nullptr;
 Process process=nullptr;
+Process resultRender=nullptr;
 Destroy destroy=nullptr;
 
 struct Patch {unsigned char* p;std::vector<unsigned char> before,after;};
@@ -107,11 +111,15 @@ bool nextKind(uint32_t kind) {
     return getRecord(kind,p,n,false);
 }
 
-void finish(void* self) {
+void finish(void* /*self*/) {
     if(!active) return;
-    State state{};
-    if(!snapshot(self,state)) {invalidate(3);active=false;return;}
-    if(!playback) emit(End,&state,sizeof(state));
+    // Cleanup may already have freed resources/unit lists. Never dereference them here.
+    // Cut off the final batch and end at its validated Before boundary, which is
+    // exactly the state playback observes before dispatching that batch.
+    if(!playback) {
+        if(frames<2) invalidate(3);
+        else emit(TrimEnd,&lastBefore,sizeof(lastBefore));
+    }
     active=false;frames=0;
 }
 
@@ -127,6 +135,14 @@ void fillInitial(void* self,Initial& value) {
 }
 
 LRESULT CALLBACK recordingWindowProc(HWND window,UINT message,WPARAM wparam,LPARAM lparam) {
+    if(message==RecordPulse) {
+        // Custom-game quit returns the map directory to the menu directory while
+        // retaining the game object. A pause alone leaves the directory unchanged.
+        if(!playback && active && !inDispatch && GetCurrentThreadId()==producer &&
+           GetTickCount64()-lastAdvanceAt.load()>1000 &&
+           strncmp(initial.directory,(const char*)address(0xb83ad9),255)) finish(nullptr);
+        return 0;
+    }
     if(message==WM_CLOSE && closePending.load() && !closeReady.load()) return 0;
     if(message==WM_CLOSE && !playback && !closeReady.load() && active && !failed.load()) {
         if(!closePending.exchange(true)) finish(at<void*>(0xb8282c));
@@ -177,6 +193,7 @@ bool discardLiveQueue() {
 }
 
 uint32_t __fastcall advanceHook(void* self,void*,uint32_t a,uint32_t b) {
+    lastAdvanceAt.store(GetTickCount64());
     if(closePending.load()) return advance(self,a,b);
     if(failed.load()) return playback?1:advance(self,a,b);
     // Multiplayer recording/replay is deliberately disabled until host latency and sync are measured.
@@ -200,6 +217,7 @@ uint32_t __fastcall advanceHook(void* self,void*,uint32_t a,uint32_t b) {
         active=true;++session;frames=0;
     }
     if(!playback) {
+        lastBefore=state;
         emit(Before,&state,sizeof(state));inDispatch=true;
         uint32_t result=advance(self,a,b);
         inDispatch=false;
@@ -231,6 +249,13 @@ uint32_t __fastcall advanceHook(void* self,void*,uint32_t a,uint32_t b) {
 uint32_t __fastcall destroyHook(void* self,void*,uint32_t flags) {
     if(GetCurrentThreadId()==producer) finish(self);
     return destroy(self,flags);
+}
+
+uint32_t __fastcall resultRenderHook(void* self,void*) {
+    // CGameResultMenu's third virtual method draws the completed-match screen.
+    // Unlike map-directory changes this also covers maps retained on results.
+    if(!playback && active && !inDispatch && GetCurrentThreadId()==producer) finish(nullptr);
+    return resultRender(self);
 }
 
 void __cdecl resetHook() {
@@ -386,7 +411,7 @@ DWORD WINAPI worker(void* argument) {
             CONTEXT context{};context.ContextFlags=CONTEXT_CONTROL;
             if(!GetThreadContext(h,&context)) ok=false;
             // Do not replace a prologue already being executed by another thread.
-            for(uint32_t va:{0x4cf2b0u,0x4c09f0u}) {
+            for(uint32_t va:{0x4cf2b0u,0x4c09f0u,0x7245d0u}) {
                 uintptr_t p=(uintptr_t)address(va);
                 if(context.Eip>p && context.Eip<p+6) ok=false;
             }
@@ -403,6 +428,7 @@ DWORD WINAPI worker(void* argument) {
         const unsigned char destroyPrefix[]={0x55,0x8b,0xec,0x56,0x8b,0xf1};
         if(ok) {process=reinterpret_cast<Process>(patchEntry(0x4cf2b0,procPrefix,sizeof(procPrefix),(void*)processHook));ok=process!=nullptr;}
         if(ok) {destroy=reinterpret_cast<Destroy>(patchEntry(0x4c09f0,destroyPrefix,sizeof(destroyPrefix),(void*)destroyHook));ok=destroy!=nullptr;}
+        if(ok) {resultRender=reinterpret_cast<Process>(patchEntry(0x7245d0,procPrefix,sizeof(procPrefix),(void*)resultRenderHook));ok=resultRender!=nullptr;}
     }
     if(!ok) {restore();log("Initialization failed; all installed owned patches restored.");}
     for(auto h:paused) {ResumeThread(h);CloseHandle(h);}
@@ -414,7 +440,8 @@ DWORD WINAPI worker(void* argument) {
     if(!ok) return 1;
     log(playback?"Playback adapter ready. Waiting for identical game-native match setup.":"Recording adapter ready. Single-player only; multiplayer intentionally excluded.");
     HANDLE file=INVALID_HANDLE_VALUE;std::wstring partial;uint32_t fileBytes=0,number=0;
-    ULONGLONG checkAt=GetTickCount64();int lastNotice=0;
+    uint32_t lastFrameOffset=0,writtenFrames=0;State writerBefore{};
+    ULONGLONG checkAt=GetTickCount64(),pulseAt=0;int lastNotice=0;
     for(;;) {
         if(!playback && !gameWindow) {
             EnumWindows(findGameWindow,0);
@@ -424,6 +451,9 @@ DWORD WINAPI worker(void* argument) {
                     gameWindow=nullptr;oldWindowProc=nullptr;
                 }
             }
+        }
+        if(gameWindow && !playback && GetTickCount64()-pulseAt>250) {
+            pulseAt=GetTickCount64();PostMessageW(gameWindow,RecordPulse,0,0);
         }
         uint32_t t=tail.load(std::memory_order_relaxed),h=head.load(std::memory_order_acquire);
         if(h-t>=sizeof(Record)) {
@@ -436,9 +466,26 @@ DWORD WINAPI worker(void* argument) {
                 partial=inbox+L"\\"+std::to_wstring(GetCurrentProcessId())+L"_"+std::to_wstring(++number)+L".partial";
                 file=CreateFileW(partial.c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
                 fileBytes=8;
+                lastFrameOffset=0;writtenFrames=0;
                 if(file==INVALID_HANDLE_VALUE || !WriteFile(file,Magic,8,&n,nullptr) || n!=8) invalidate(11);
             }
             if(file!=INVALID_HANDLE_VALUE && !failed.load()) {
+                if(record.kind==Before && record.size==sizeof(State)) {
+                    lastFrameOffset=fileBytes;++writtenFrames;memcpy(&writerBefore,payload,sizeof(State));
+                }
+                if(record.kind==TrimEnd) {
+                    if(writtenFrames<2 || record.size!=sizeof(State) || memcmp(payload,&writerBefore,sizeof(State))) invalidate(6);
+                    else {
+                        LARGE_INTEGER offset{};offset.QuadPart=lastFrameOffset;
+                        if(!SetFilePointerEx(file,offset,nullptr,FILE_BEGIN) || !SetEndOfFile(file)) invalidate(11);
+                        else {fileBytes=lastFrameOffset;record.kind=End;}
+                    }
+                }
+                if(failed.load()) {
+                    tail.store(t+sizeof(record)+record.size,std::memory_order_release);
+                    if(closePending.load()) {closeReady.store(true);PostMessageW(gameWindow,WM_CLOSE,0,0);}
+                    log("Writer ending boundary/truncation failed; incomplete capture preserved.");return 1;
+                }
                 fileBytes+=sizeof(record)+record.size;
                 if(fileBytes>MaxFile || !WriteFile(file,&record,sizeof(record),&n,nullptr) || n!=sizeof(record) ||
                    !WriteFile(file,payload,record.size,&n,nullptr) || n!=record.size) invalidate(11);
@@ -457,6 +504,7 @@ DWORD WINAPI worker(void* argument) {
         if(issue!=lastNotice) {char line[100];wsprintfA(line,"Engine status code: %d (see docs/ENGINE_NATIVE.md)",issue);log(line);lastNotice=issue;}
         if(GetTickCount64()-checkAt>2000 && !terminal.load()) {
             checkAt=GetTickCount64();
+            if(file!=INVALID_HANDLE_VALUE && !failed.load() && !FlushFileBuffers(file)) invalidate(11);
             AcquireSRWLockShared(&codeLock);
             bool valid=!memcmp(expectedText.data(),(void*)textBase,textSize);
             ReleaseSRWLockShared(&codeLock);

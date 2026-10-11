@@ -20,6 +20,7 @@ uint32_t __fastcall fakeAdvance(void* self,void*,uint32_t,uint32_t) {
     return 1;
 }
 uint32_t __fastcall fakeCount(void*,void*) {return queueCount;}
+uint32_t __fastcall fakeResultRender(void*,void*) {return 123;}
 uint32_t __fastcall fakePop(void*,void*,void*,uint32_t*) {--queueCount;return 4;}
 void resetState() {
     closePending.store(false);closeReady.store(false);
@@ -49,7 +50,8 @@ int main() {
     void** queue=vtable;at<void*>(0xb870c8)=&queue;
     apply=reinterpret_cast<Apply>(fakeApply);advance=reinterpret_cast<Advance>(fakeAdvance);
     resetState();playback=false;
-    advanceHook(&self,nullptr,0,0);simulate();advanceHook(&self,nullptr,0,0);simulate();finish(&self);
+    advanceHook(&self,nullptr,0,0);simulate();advanceHook(&self,nullptr,0,0);simulate();
+    State fullEnd{};require(snapshot(&self,fullEnd),"fixture live ending snapshot");emit(End,&fullEnd,sizeof(fullEnd));active=false;
     require(!failed.load() && applied==4,"capture two real callback batches");
     input.assign(Magic,Magic+8);
     uint32_t size=head.load();size_t begin=input.size();input.resize(begin+size);readRing(0,input.data()+begin,size);
@@ -65,11 +67,27 @@ int main() {
     State s{};emit(Before,&s,sizeof(s));require(failed.load() && notice.load()==2,"bounded ring overflow fails without blocking");
     resetState();head.store(0);tail.store(0);at<void*>(0xb8282c)=&self;
     advanceHook(&self,nullptr,0,0);
+    simulate();advanceHook(&self,nullptr,0,0);
     uint32_t beforeClose=head.load();
+    at<void*>(0xb870c0)=nullptr; // Real quit frees this before the game-object destructor.
     require(recordingWindowProc(nullptr,WM_CLOSE,0,0)==0 && closePending.load() && !active,"normal close queues match ending without blocking");
+    require(!failed.load(),"ending never reads freed game state");
+    Record closeRecord{};readRing(beforeClose,&closeRecord,sizeof(closeRecord));
+    require(closeRecord.kind==TrimEnd,"ending uses verified prior dispatch boundary");
+    at<void*>(0xb870c0)=&self;
     require(head.load()==beforeClose+sizeof(Record)+sizeof(State),"exactly one close end record");
     uint32_t afterClose=head.load();
     require(recordingWindowProc(nullptr,WM_CLOSE,0,0)==0 && head.load()==afterClose,"repeated close waits for writer acknowledgement");
+    resetState();head.store(0);tail.store(0);advanceHook(&self,nullptr,0,0);simulate();advanceHook(&self,nullptr,0,0);
+    lastAdvanceAt.store(0);
+    recordingWindowProc(nullptr,RecordPulse,0,0);
+    require(active,"a paused match with unchanged map path must not finalize");
+    strcpy_s((char*)address(0xb83ad9),256,"res\\map\\");
+    recordingWindowProc(nullptr,RecordPulse,0,0);
+    require(!active && !failed.load(),"results/menu directory transition finalizes retained game object");
+    resetState();head.store(0);tail.store(0);advanceHook(&self,nullptr,0,0);simulate();advanceHook(&self,nullptr,0,0);
+    resultRender=reinterpret_cast<Process>(fakeResultRender);
+    require(resultRenderHook(&self,nullptr)==123 && !active && !failed.load(),"result rendering ends capture with unchanged map path and preserves original callback");
     resetState();patches.clear();
     auto call=(unsigned char*)address(0x4cfc55);call[0]=0xe8;
     delta=(int32_t)((uintptr_t)address(0x4daf50)-(uintptr_t)call-5);memcpy(call+1,&delta,4);

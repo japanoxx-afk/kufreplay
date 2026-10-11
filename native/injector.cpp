@@ -81,9 +81,11 @@ static int steamRecord(wchar_t** argv) {
         HMODULE local=LoadLibraryExW(argv[2],nullptr,DONT_RESOLVE_DLL_REFERENCES);
         FARPROC start=local?GetProcAddress(local,"StartReplay"):nullptr;
         ReplayStartConfig config{};
-        ok=start && wcslen(argv[3])<1024;
+        ok=start && wcslen(argv[3])<1024 && wcslen(argv[5])<1024;
         if(ok) {
             wcscpy_s(config.root,argv[3]);wcscpy_s(config.event,eventName.c_str());
+            config.playback=!wcscmp(argv[4],L"steam-play");
+            if(config.playback) wcscpy_s(config.input,argv[5]);
             remote=VirtualAllocEx(process,nullptr,sizeof(config),MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
             ok=remote && WriteProcessMemory(process,remote,&config,sizeof(config),nullptr);
             if(ok) thread=CreateRemoteThread(process,nullptr,0,(LPTHREAD_START_ROUTINE)(loaded+(uintptr_t)start-(uintptr_t)local),remote,0,nullptr);
@@ -112,7 +114,7 @@ int wmain(int argc,wchar_t** argv) {
     if(argc!=6) {fwprintf(stderr,L"Usage: injector GAME DLL ROOT record|play INPUT\n");return 2;}
     if(!knownGame(argv[1])) {fwprintf(stderr,L"Unsupported game SHA256. No process was patched.\n");return 3;}
     if(gameRunning()) {fwprintf(stderr,L"Close the running game before starting a recorded session.\n");return 4;}
-    if(!wcscmp(argv[4],L"steam-record")) return steamRecord(argv);
+    if(!wcscmp(argv[4],L"steam-record") || !wcscmp(argv[4],L"steam-play")) return steamRecord(argv);
     if(wcscmp(argv[4],L"record") && wcscmp(argv[4],L"play")) return 2;
     SetEnvironmentVariableW(L"KUF_REPLAY_ROOT",argv[3]);
     SetEnvironmentVariableW(L"KUF_REPLAY_MODE",argv[4]);

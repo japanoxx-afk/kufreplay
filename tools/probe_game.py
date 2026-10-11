@@ -44,7 +44,7 @@ def probe(pid):
         for name,va,size in [('tick',0xb8a280,4),('seed',0xbed1e8,4),('rng_count',0xb827dc,4),
                              ('game_object',0xb8282c,4),('network_mode',0xb83ad0,1),
                              ('playback_flag',0xb83ad8,1),('record_flag',0xbea2a3,1),
-                             ('map_path',0xb83ad9,256),('queue',0xb870c8,4)]:
+                             ('map_path',0xb83ad9,256),('map_name',0xb83bd9,256),('unit_manager',0xb870c0,4),('queue',0xb870c8,4)]:
             b=read(va,size)
             result[name]=b.split(b'\0')[0].decode('cp949','replace') if size==256 else int.from_bytes(b,'little')
         return result

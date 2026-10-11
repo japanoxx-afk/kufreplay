@@ -1,6 +1,7 @@
 import os
 import queue
 import threading
+from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
@@ -66,7 +67,7 @@ class Launcher:
         root.after(2000, self.collect)
 
     def collect(self):
-        if not self.busy and any((self.store.root/'CaptureInbox').glob('*.partial.complete')):
+        if not self.busy and any((self.store.root/'CaptureInbox').glob('*.partial*')):
             game_path = self.game_path.get()
             def run():
                 completed, errors=collect_completed(game_path,self.store)
@@ -111,7 +112,9 @@ class Launcher:
             duration = m['ticks'] // m['tick_rate']
             time_text=f'{duration//60}:{duration%60:02d}' if m.get('duration_verified',True) else f"{m['ticks']}틱"
             compat='실험용 · 같은 경기 설정 필요' if m['adapter_id']==ADAPTER else '호환 어댑터 없음'
-            row = self.tree.insert('', 'end', values=(m['recorded_at'], m['map_id'], time_text, '★' if pin else '', compat))
+            if m.get('recovery'): compat='종료 누락 복구 · 마지막 배치 제외 · '+compat
+            date_text=datetime.fromisoformat(m['recorded_at']).astimezone().strftime('%Y-%m-%d %H:%M:%S')
+            row = self.tree.insert('', 'end', values=(date_text, m['map_id'], time_text, '★' if pin else '', compat))
             self.rows[row] = (p, m, pin)
         self.status.set(f'{len(items)}개 · {self.store.replays}')
 
@@ -131,7 +134,7 @@ class Launcher:
             p,m,_=item
             game=self.game_path.get()
             def run():
-                return launch_engine(game,self.store,mode='play',replay=p)
+                return launch_engine(game,self.store,mode='steam-play',replay=p)
             def done(pid):
                 self.status.set(f'재생 엔진 연결 · PID {pid} · 게임에서 같은 지도/진영/슬롯/규칙으로 시작하세요.')
                 messagebox.showinfo('실험용 재생 준비', f"지도: {m['map_id']}\n\n게임에서 기록 당시와 같은 경기 설정으로 싱글플레이를 시작하세요.\n초기 상태·틱·난수·체크섬이 다르면 재생을 중단합니다.\n현재는 경기 설정 자동 복원과 외부 PC 재생이 미지원입니다.")
