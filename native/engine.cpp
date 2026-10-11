@@ -31,6 +31,11 @@ State lastBefore{};
 Initial savedInitial{};
 MatchSetup savedSetup{};
 bool automaticStarted=false,hasSetup=false;
+NetworkBootstrap capturedBootstrap{},savedBootstrap{};
+bool hasCapturedBootstrap=false,hasBootstrap=false;
+bool bootstrapEmitted=false;
+bool restoredEmptyNetworkInitial=false;
+bool exitConfirmationOpen=false,playbackExitRequested=false;
 std::vector<unsigned char> input,expectedText;
 size_t cursor=8;
 uintptr_t textBase=0;
@@ -40,6 +45,7 @@ std::atomic<int> notice{0};
 HWND gameWindow=nullptr;
 WNDPROC oldWindowProc=nullptr;
 std::atomic<bool> closePending{false},closeReady{false};
+std::atomic<bool> windowDestroyed{false};
 constexpr UINT RecordPulse=WM_APP+0x4b1;
 std::atomic<ULONGLONG> lastAdvanceAt{0};
 
@@ -50,20 +56,124 @@ using Apply=uint32_t(__thiscall*)(void*,uint32_t,const void*);
 using Process=uint32_t(__thiscall*)(void*);
 using Destroy=uint32_t(__thiscall*)(void*,uint32_t);
 Advance advance=nullptr;
+Advance initializeMap=nullptr;
 Apply apply=nullptr;
 Process process=nullptr;
 Process resultRender=nullptr;
 Process applicationProcess=nullptr;
 Process prepareDisplay=nullptr,drawDisplay=nullptr;
+Process interfaceRender=nullptr;
+using Audio=uint32_t(__thiscall*)(void*,uint32_t,uint32_t,int,int,uint32_t);
+Audio spatialAudio=nullptr,spatialLoopAudio=nullptr;
+unsigned observerAudioDepth=0;
+std::atomic<uint32_t> observerAudioCalls{0};
+using Selection=uint32_t(__thiscall*)(void*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
+Selection originalSelection=nullptr;
+uint32_t __fastcall selectionHook(void* self,void*,uint32_t a,uint32_t b,uint32_t c,uint32_t d,uint32_t e,uint32_t f,uint32_t g,uint32_t h) {
+    if(playback && active && !inDispatch) return 0;
+    return originalSelection(self,a,b,c,d,e,f,g,h);
+}
 Destroy destroy=nullptr;
-struct VisibilityBackup {unsigned char* object;unsigned char fog;};
+struct VisibilityBackup {unsigned char* object;unsigned char fog;unsigned char invisible;};
 VisibilityBackup visibilityBackups[11264]{};
 unsigned visibilityCount=0,displayDepth=0;
 unsigned char savedFog=0;
+int savedViewportWidth=0;
+struct ClipBackup {unsigned char* object;int width;};
+ClipBackup clipBackups[2]{};
+unsigned clipCount=0;
+bool showResources=true,showObserverHud=true;
+unsigned replaySpeed=1;
+uint32_t clockWall=0,clockValue=0,clockTarget=0;
+State savedEnd{};
+int observerSelected=-1;
+alignas(16) unsigned char observerPanel[0x1908]{}; // Native deleting destructor 500471 verifies this size.
+void* observerPanelSource=nullptr;
+int panelSelected=-2;
+int16_t observerSelectionSlots[16]{};
+bool observerPanelDrawing=false;
+unsigned char* observerTerrainPixels=nullptr;
+unsigned char* observerTerrainRows=nullptr;
+size_t observerTerrainCapacity=0,observerRowCapacity=0;
+unsigned char* observerUnit(int index);
+
+uint32_t observerAudio(void* self,Audio original,uint32_t a,uint32_t b,int x,int y,uint32_t c) {
+    if(!playback || !active || GetCurrentThreadId()!=producer) return original(self,a,b,x,y,c);
+    int savedWidth=at<int>(0xbf2588);uint32_t result=0;
+    __try {
+        ++observerAudioDepth;++observerAudioCalls;
+        if(!showObserverHud) at<int>(0xbf2588)=at<int>(0xbf2578)-at<int>(0xbf2580);
+        result=original(self,a,b,x,y,c);
+    } __finally {--observerAudioDepth;at<int>(0xbf2588)=savedWidth;}
+    return result;
+}
+uint32_t __fastcall spatialAudioHook(void* self,void*,uint32_t a,uint32_t b,int x,int y,uint32_t c) {return observerAudio(self,spatialAudio,a,b,x,y,c);}
+uint32_t __fastcall spatialLoopAudioHook(void* self,void*,uint32_t a,uint32_t b,int x,int y,uint32_t c) {return observerAudio(self,spatialLoopAudio,a,b,x,y,c);}
+int __fastcall observerAudioVisibility(void* self,void*,int player,int x,int y) {
+    // Only the two spatial audio call sites use this hook. Simulation fog stays intact.
+    if(observerAudioDepth && GetCurrentThreadId()==producer) return 1;
+    using Visible=int(__thiscall*)(void*,int,int,int);
+    return ((Visible)address(0x4369f0))(self,player,x,y);
+}
+
+uint32_t drawExpandedTerrain(void* self,Process original) {
+    auto terrain=(unsigned char*)self;
+    auto surface=*(unsigned char**)(terrain+4);
+    auto image=*(void**)(terrain+0xc);
+    using Dimension=int(__thiscall*)(void*);
+    if(!image || *(int*)(terrain+0x30)<0) return original(self);
+    int tileWidth=((Dimension)address(0x67bfe0))(image);
+    int width=at<int>(0xbf2588),height=*(int*)(terrain+0x20);
+    if(!surface || tileWidth<=0 || tileWidth>512 || width<=0 || width>4096 || height<=0 || height>4096) return original(self);
+    int columns=(width+tileWidth-1)/tileWidth+1,pitch=columns*tileWidth;
+    size_t pixels=(size_t)pitch*height*2,rows=(size_t)height*4;
+    if(pixels>observerTerrainCapacity) {
+        auto next=(unsigned char*)HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,pixels);
+        if(!next) return original(self);
+        if(observerTerrainPixels) HeapFree(GetProcessHeap(),0,observerTerrainPixels);
+        observerTerrainPixels=next;observerTerrainCapacity=pixels;
+    }
+    if(rows>observerRowCapacity) {
+        auto next=(unsigned char*)HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,rows);
+        if(!next) return original(self);
+        if(observerTerrainRows) HeapFree(GetProcessHeap(),0,observerTerrainRows);
+        observerTerrainRows=next;observerRowCapacity=rows;
+    }
+    unsigned char saved[0x3c];memcpy(saved,terrain,sizeof(saved));
+    int surfaceWidth=*(int*)(surface+4);uint32_t result=0;
+    using Tile=void*(__thiscall*)(void*,int);
+    auto tile=(unsigned char*)((Tile)address(0x67eea0))(image,*(int*)(terrain+0x30));
+    if(!tile) return original(self);
+    int originX=*(int*)(tile+0x30),originY=*(int*)(tile+0x34);
+    __try {
+        *(int*)(surface+4)=width;
+        *(void**)(terrain+0x10)=observerTerrainPixels;
+        *(void**)(terrain+0x2c)=observerTerrainRows;
+        *(int*)(terrain+0x1c)=pitch;*(int*)(terrain+0x24)=columns;
+        memset(observerTerrainRows,0,rows);terrain[8]=1;
+        using Refresh=void(__thiscall*)(void*,int,int);
+        ((Refresh)address(0x682430))(self,originX,originY);
+        result=original(self);
+    } __finally {
+        memcpy(terrain,saved,sizeof(saved));*(int*)(surface+4)=surfaceWidth;
+    }
+    return result;
+}
 
 void enterObserverDisplay() {
     if(displayDepth++) return;
     savedFog=at<unsigned char>(0xb3ba61);visibilityCount=0;
+    savedViewportWidth=at<int>(0xbf2588);
+    clipCount=0;
+    if(!showObserverHud) at<int>(0xbf2588)=at<int>(0xbf2578)-at<int>(0xbf2580);
+    auto game=(unsigned char*)at<void*>(0xb8282c);
+    if(game && !showObserverHud) for(unsigned offset:{0x9b4u,0x9b8u}) {
+        auto context=*(unsigned char**)(game+offset);
+        if(context && *(void**)context==address(0xa2cea8)) {
+            clipBackups[clipCount++]={context,*(int*)(context+0x974)};
+            *(int*)(context+0x974)=at<int>(0xbf2588);
+        }
+    }
     void* manager=at<void*>(0xb870c0);
     if(manager) {
         auto bytes=(unsigned char*)manager;
@@ -72,8 +182,9 @@ void enterObserverDisplay() {
         for(uint32_t i=0;i<count && index<11264;++i) {
             auto unit=((unsigned char**)(bytes+0x2c38))[index];
             if(unit) {
-                visibilityBackups[visibilityCount++]={unit,unit[0x6b]};
+                visibilityBackups[visibilityCount++]={unit,unit[0x6b],unit[0x69]};
                 unit[0x6b]=0; // The native display-only fog cache (517560/496f26).
+                unit[0x69]=0; // Native invisibility gates, scoped strictly to display callbacks.
             }
             index=*(uint32_t*)(bytes+0xdc4c+index*12);
         }
@@ -83,8 +194,14 @@ void enterObserverDisplay() {
 
 void leaveObserverDisplay() {
     if(--displayDepth) return;
-    for(unsigned i=0;i<visibilityCount;++i) visibilityBackups[i].object[0x6b]=visibilityBackups[i].fog;
+    for(unsigned i=0;i<visibilityCount;++i) {
+        visibilityBackups[i].object[0x6b]=visibilityBackups[i].fog;
+        visibilityBackups[i].object[0x69]=visibilityBackups[i].invisible;
+    }
     visibilityCount=0;at<unsigned char>(0xb3ba61)=savedFog;
+    at<int>(0xbf2588)=savedViewportWidth;
+    for(unsigned i=0;i<clipCount;++i) *(int*)(clipBackups[i].object+0x974)=clipBackups[i].width;
+    clipCount=0;
 }
 
 uint32_t observerDisplay(void* self,Process original) {
@@ -96,8 +213,208 @@ uint32_t observerDisplay(void* self,Process original) {
 }
 uint32_t __fastcall prepareDisplayHook(void* self,void*) {return observerDisplay(self,prepareDisplay);}
 uint32_t __fastcall drawDisplayHook(void* self,void*) {return observerDisplay(self,drawDisplay);}
+uint32_t __fastcall observerPanelHook(void* self,void*) {
+    if(playback && active && !showObserverHud) return 0;
+    auto original=(Process)(*(void***)self)[4];
+    if(!playback || !active) return original(self);
+    auto game=(unsigned char*)at<void*>(0xb8282c);
+    auto ui=(unsigned char*)self;
+    if(!game || *(void**)(ui+0x23c)!=((void**)(game+0x48))[*(uint32_t*)(game+0x664)]) return original(self);
+    if(observerPanelSource!=self) {
+        memcpy(observerPanel,self,sizeof(observerPanel));
+        observerPanelSource=self;panelSelected=-2;
+    }
+    auto unit=observerUnit(observerSelected);
+    int owner=unit?*(int16_t*)(unit+8):-1;
+    bool valid=unit && owner>=0 && owner<8 && *(int16_t*)(unit+0x4c)==0 && *(uint16_t*)(unit+0x14)>0;
+    int selected=valid?observerSelected:-1;
+    memset(observerSelectionSlots,0xff,sizeof(observerSelectionSlots));
+    observerSelectionSlots[0]=(int16_t)selected;
+    *(int16_t*)(observerPanel+0x1898)=valid?1:0;
+    *(void**)(observerPanel+0x189c)=observerSelectionSlots;
+    if(panelSelected!=selected) {
+        panelSelected=selected;
+        *(int*)(observerPanel+0x18a4)=-1;
+        *(int*)(observerPanel+0x6a4)=-1;
+        *(int*)(observerPanel+0x2b4)=-1;
+        *(uint16_t*)(observerPanel+0x6a8)=0xffff;
+        *(uint16_t*)(observerPanel+0x6ac)=0xffff;
+    }
+    uint32_t savedPlayer=*(uint32_t*)(game+0x664),result=0;
+    *(void**)(observerPanel+0x23c)=valid?((void**)(game+0x48))[owner]:*(void**)(ui+0x23c);
+    __try {
+        observerPanelDrawing=true;
+        if(valid) *(uint32_t*)(game+0x664)=(uint32_t)owner;
+        result=original(observerPanel);
+    } __finally {*(uint32_t*)(game+0x664)=savedPlayer;observerPanelDrawing=false;}
+    return result;
+}
+uint32_t __fastcall observerSelectionSync(void* self,void*,uint32_t writePlayerSelection) {
+    using Sync=uint32_t(__thiscall*)(void*,uint32_t);
+    return ((Sync)address(0x512a00))(self,observerPanelDrawing?0:writePlayerSelection);
+}
+uint32_t __fastcall observerLayerHook(void* self,void*) {
+    auto original=(Process)(*(void***)self)[2];
+    if(playback && active && showObserverHud && original==(Process)address(0x4b3ff0)) {
+        // 4b2fa0 produces the minimap pixels and tests the display fog flag.
+        // Regenerate in the existing display scope, without changing exploration data.
+        auto map=(unsigned char*)self;
+        // The first loading frames register this layer before its terrain source.
+        // Native messages initialize 3c/1c later; never run the producer early.
+        auto source=*(unsigned char**)(map+0x3c);
+        if(*(int*)(map+0x1c)<=0 || (map[0x9f] && (!source || !*(void**)(source+0x28)))) return original(self);
+        unsigned char dirty=map[0xa2];uint32_t stamp=at<uint32_t>(0xb8a244),result=0;
+        __try {map[0xa2]=1;((Process)address(0x4b2fa0))(self);result=original(self);}
+        __finally {map[0xa2]=dirty;at<uint32_t>(0xb8a244)=stamp;}
+        return result;
+    }
+    if(playback && active && !showObserverHud) {
+        if(original==(Process)address(0x6819e0)) return drawExpandedTerrain(self,original);
+        if(original==(Process)address(0x4b3ff0) || original==(Process)address(0x505100)) return 1;
+        auto game=(unsigned char*)at<void*>(0xb8282c);
+        if(game) for(unsigned i=0;i<8;++i) {
+            auto player=((unsigned char**)(game+0x48))[i];
+            auto ui=player?*(unsigned char**)(player+0x5e0):nullptr;
+            if(ui && *(void**)(ui+0x10)==self) return 1;
+        }
+    }
+    return original(self);
+}
 uint32_t __fastcall observerInputOne(void*,void*,uint32_t) {return 0;}
 uint32_t __fastcall observerInputTwo(void*,void*,uint32_t,uint32_t) {return 0;}
+
+uint32_t __stdcall playbackClock() {
+    using Timer=uint32_t(__stdcall*)();
+    uint32_t now=((Timer)at<void*>(0xa16cfc))();
+    if(exitConfirmationOpen) {clockWall=now;return clockValue;}
+    if(playback && savedInitial.networkMode==1 && automaticStarted) {
+        if(!clockWall) {clockWall=now;clockValue=now;clockTarget=now;return now;}
+        clockTarget+=(now-clockWall)*replaySpeed;
+        uint32_t delta=clockTarget-clockValue;
+        uint32_t interval=savedBootstrap.tickInterval;
+        if(delta>interval) delta=interval;
+        clockValue+=delta;clockWall=now;return clockValue;
+    }
+    if(!clockWall || !active) {clockWall=now;clockValue=now;return now;}
+    clockValue+=(now-clockWall)*replaySpeed;clockWall=now;
+    return clockValue;
+}
+
+struct ObserverPlayer {bool participant;int steel,gold,mana,population,capacity,farmers;};
+ObserverPlayer observerPlayers[8]{};
+uint32_t observerRefreshAt=0;
+unsigned char* observerUnit(int index) {
+    auto manager=(unsigned char*)at<void*>(0xb870c0);
+    return manager && index>=0 && index<11264?((unsigned char**)(manager+0x2c38))[index]:nullptr;
+}
+void refreshObserver(void* self) {
+    if(at<uint32_t>(0xb8a280)-observerRefreshAt<8 && observerRefreshAt) return;
+    observerRefreshAt=at<uint32_t>(0xb8a280);
+    auto game=(unsigned char*)self;
+    for(unsigned i=0;i<8;++i) {
+        auto player=((unsigned char**)(game+0x48))[i];
+        auto& row=observerPlayers[i];row={};
+        if(!player || !player[0xc] || *(uint32_t*)(player+8)==3000 || *(uint32_t*)(player+8)==0xffffffff) continue;
+        row.participant=true;
+        row.steel=*(int*)(player+0xa08);row.gold=*(int*)(player+0xa0c);row.mana=*(int*)(player+0xa10);
+        row.population=*(int*)(player+0xe24);
+        using Capacity=int(__thiscall*)(void*);
+        row.capacity=((Capacity)address(0x522760))(player);
+    }
+    auto manager=(unsigned char*)at<void*>(0xb870c0);
+    if(!manager) return;
+    uint32_t count=*(uint32_t*)(manager+0xdc38),index=*(uint32_t*)(manager+0xdc3c);
+    if(count>11264) return;
+    for(uint32_t i=0;i<count && index<11264;++i) {
+        auto unit=observerUnit((int)index);
+        if(unit) {
+            int owner=*(int16_t*)(unit+8),type=*(int16_t*)(unit+4);
+            if(owner>=0 && owner<8 && observerPlayers[owner].participant && (type==0 || type==15) &&
+               *(int16_t*)(unit+6)==0 && *(int16_t*)(unit+0x4c)==0 && *(uint16_t*)(unit+0x14)>0 && !unit[0x67]) ++observerPlayers[owner].farmers;
+        }
+        index=*(uint32_t*)(manager+0xdc4c+index*12);
+    }
+}
+void observerText(void* self,int x,int y,const char* text) {
+    using Text=void*(__thiscall*)(void*,int,int,const char*,int,int,int);
+    void* font=*(void**)((unsigned char*)self+0x678);
+    if(font) ((Text)address(0x549cf0))(font,x,y,text,(int)strlen(text),0,-1);
+}
+uint32_t __fastcall interfaceHook(void* self,void*) {
+    uint32_t result=interfaceRender(self);
+    if(!active || !playback) return result;
+    refreshObserver(self);
+    char line[256]{};
+    if(showObserverHud) {
+        // The renderer's native dimensions are used; no recorded-resolution coordinates.
+        uint32_t tick=at<uint32_t>(0xb8a280),interval=at<uint32_t>(0xb3bae8);
+        uint32_t elapsed=(uint32_t)((uint64_t)(tick-savedInitial.state.tick)*interval/1000);
+        uint32_t duration=(uint32_t)((uint64_t)(savedEnd.tick-savedInitial.state.tick)*interval/1000);
+        sprintf_s(line,"REPLAY %ux  %u:%02u/%u:%02u",replaySpeed,elapsed/60,elapsed%60,duration/60,duration%60);
+        observerText(self,std::max(12,at<int>(0xbf2588)-300),8,line);
+    }
+    if(showResources) {
+        const int columns[]={0,30,85,135,180,240};
+        const char* labels[]={"P","Gold","Steel","Mana","Pop","Farm"};
+        int x=std::max(12,at<int>(0xbf2588)-300);
+        for(unsigned c=0;c<6;++c) observerText(self,x+columns[c],28,labels[c]);
+        int y=46;
+        for(unsigned i=0;i<8;++i) if(observerPlayers[i].participant) {
+            auto& row=observerPlayers[i];
+            sprintf_s(line,"%u",i+1);observerText(self,x+columns[0],y,line);
+            int values[]={row.gold,row.steel,row.mana,row.population,row.farmers};
+            for(unsigned c=1;c<6;++c) {
+                if(c==4) sprintf_s(line,"%d/%d",row.population,row.capacity);
+                else sprintf_s(line,"%d",values[c-1]);
+                observerText(self,x+columns[c],y,line);
+            }
+            y+=17;
+        }
+    }
+    auto unit=observerUnit(observerSelected);
+    if(showObserverHud && unit && *(int16_t*)(unit+0x4c)==0) {
+        int type=*(int16_t*)(unit+4);
+        const char* known=type==0?"Peasant":type==15?"Gnome Slave":type==46?"Keep":type==62?"Fortress":(*(int16_t*)(unit+6)?"Building":"Unit");
+        sprintf_s(line,"Observer: P%d  %s #%d  HP %u/%u",*(int16_t*)(unit+8)+1,
+            known,type,*(uint16_t*)(unit+0x14),*(uint16_t*)(unit+0x16));
+        observerText(self,12,std::max(140,at<int>(0xbf257c)-64),line);
+        // Native construction progress (478970); do not confuse the sprite stage
+        // at 14a6 with a training/research queue.
+        if(*(int16_t*)(unit+6)==1 && unit[0x1491] && *(uint16_t*)(unit+0x16)) {
+            uint32_t percent=(*(uint32_t*)(unit+0x1498)>>10)*100/ *(uint16_t*)(unit+0x16);
+            sprintf_s(line,"Construction: %u%%",std::min(percent,100u));
+            observerText(self,12,std::max(162,at<int>(0xbf257c)-42),line);
+        }
+    }
+    return result;
+}
+bool selectObserverUnit(int x,int y) {
+    auto game=(unsigned char*)at<void*>(0xb8282c);
+    auto manager=(unsigned char*)at<void*>(0xb870c0);
+    if(!game || !manager) return false;
+    RECT client{};GetClientRect(gameWindow,&client);
+    if(client.right<=0 || client.bottom<=0) return false;
+    x=x*at<int>(0xbf2578)/client.right;y=y*at<int>(0xbf257c)/client.bottom;
+    int width=showObserverHud?at<int>(0xbf2588):at<int>(0xbf2578)-at<int>(0xbf2580);
+    if(x<at<int>(0xbf2580) || y<at<int>(0xbf2584) || x>=at<int>(0xbf2580)+width || y>=at<int>(0xbf2584)+at<int>(0xbf258c)) return false;
+    x+=*(int*)(game+0x9c4)-at<int>(0xbf2580);y+=*(int*)(game+0x9c8)-at<int>(0xbf2584);
+    uint32_t count=*(uint32_t*)(manager+0xdc38),index=*(uint32_t*)(manager+0xdc3c);
+    if(count>11264) return true;
+    observerSelected=-1;int distance=0x7fffffff;
+    for(uint32_t i=0;i<count && index<11264;++i) {
+        auto unit=observerUnit((int)index);
+        if(unit && *(int16_t*)(unit+0x4c)==0 && *(uint16_t*)(unit+0x14)>0) {
+            int dx=*(int*)(unit+0x18)-x,dy=*(int*)(unit+0x1c)-y;
+            int radius=*(int16_t*)(unit+6)?80:40;
+            if(abs(dx)<=radius && abs(dy)<=radius) {
+                int score=dx*dx+dy*dy;
+                if(score<distance) {distance=score;observerSelected=(int)index;}
+            }
+        }
+        index=*(uint32_t*)(manager+0xdc4c+index*12);
+    }
+    return true;
+}
 
 struct Patch {unsigned char* p;std::vector<unsigned char> before,after;};
 std::vector<Patch> patches;
@@ -170,7 +487,7 @@ void finish(void* /*self*/) {
         if(frames<2) invalidate(3);
         else emit(TrimEnd,&lastBefore,sizeof(lastBefore));
     }
-    active=false;frames=0;
+    active=false;frames=0;hasCapturedBootstrap=false;bootstrapEmitted=false;
 }
 
 void fillInitial(void* self,Initial& value) {
@@ -187,7 +504,7 @@ void fillInitial(void* self,Initial& value) {
 bool validSetup(const MatchSetup& setup) {
     if((setup.version!=1 && setup.version!=2) || setup.scenarioMode!=0 || setup.rtsMode!=1 || setup.gameType>5 || setup.localPlayer>=8) return false;
     for(unsigned i=0;i<8;++i) if(setup.players[i]>1 || setup.resources[i]>3) return false;
-    for(unsigned i=0;i<12;++i) if(setup.nativeOptions[i]>2) return false;
+    for(unsigned i=0;i<9;++i) if(setup.nativeOptions[i]>2) return false;
     return setup.players[setup.localPlayer]==0;
 }
 
@@ -200,6 +517,73 @@ void captureSetup(void* self,MatchSetup& setup) {
     memcpy(setup.nativeOptions,(unsigned char*)self+0xc78,sizeof(setup.nativeOptions));
 }
 
+bool validBootstrap(const NetworkBootstrap& value) {
+    if(value.version!=1 || value.scenarioMode!=0 || value.rtsMode!=1 || value.participants<1 ||
+       value.participants>11 || value.localPlayer>=8 || value.tickInterval<1 || value.tickInterval>1000) return false;
+    for(unsigned i=0;i<11;++i) {
+        // Slot 10 is native auxiliary state: command 1007 leaves an opaque
+        // controller word; map initialization assigns it 2 at 4c7ee9.
+        if((i<10 && value.slots[i][0]>3) || value.slots[i][1]<1000 || value.slots[i][1]>4000 ||
+           value.slots[i][1]%1000 || value.slots[i][2]>65535 || value.slots[i][3]>1) return false;
+    }
+    for(unsigned i=0;i<9;++i) if(value.nativeOptions[i]>2) return false;
+    return true;
+}
+
+uint32_t __fastcall initializeMapHook(void* self,void*,uint32_t a,uint32_t b) {
+    if(!playback) {
+        hasCapturedBootstrap=false;
+        if(at<unsigned char>(0xb83ad0)==1) {
+            NetworkBootstrap value{};value.version=1;
+            value.scenarioMode=at<uint16_t>(0xb83ad2);value.rtsMode=at<unsigned char>(0xb83ad4);
+            value.participants=at<uint16_t>(0xb83ad6);value.localPlayer=*(uint32_t*)((unsigned char*)self+0x664);
+            value.seed=at<uint32_t>(0xbed1e8);value.randomCount=at<uint32_t>(0xb827dc);
+            value.tickInterval=at<uint32_t>(0xb3bae8);
+            for(unsigned i=0;i<11;++i) {
+                memcpy(value.slots[i],address(0xb83cdc+i*0x40c),12);
+                value.slots[i][3]=at<unsigned char>(0xb83ce8+i*0x40c);
+            }
+            memcpy(value.nativeOptions,(unsigned char*)self+0xc78,16);
+            capturedBootstrap=value;hasCapturedBootstrap=validBootstrap(value);
+            // Network command 1007 initializes the map AFTER Begin/Before.
+            // Preserve this sample at its actual position in the command journal.
+            if(active && inDispatch && !bootstrapEmitted) {
+                emit(Bootstrap,&value,sizeof(value));bootstrapEmitted=true;
+            }
+        }
+        return initializeMap(self,a,b);
+    }
+    if(savedInitial.networkMode!=1) return initializeMap(self,a,b);
+    if(!hasBootstrap) {invalidate(14);return 0;}
+    if(!inDispatch && savedInitial.state.checksum==0 && savedInitial.state.seed==0 && savedInitial.state.randomCount==0) {
+        // The recorded session begins with an empty world. Command 1007 will
+        // perform the real native map initialization at the recorded tick.
+        for(unsigned i=0;i<11;++i) memcpy(address(0xb83cdc+i*0x40c),savedInitial.slots[i],12);
+        return 1;
+    }
+    // Only native map generation sees the original network rules. The outer loader
+    // remains offline, so it never waits for peers or sends network messages.
+    unsigned char mode=at<unsigned char>(0xb83ad0);
+    uint32_t result=0;
+    __try { __try {
+        at<unsigned char>(0xb83ad0)=1;at<uint16_t>(0xb83ad2)=(uint16_t)savedBootstrap.scenarioMode;
+        at<unsigned char>(0xb83ad4)=(unsigned char)savedBootstrap.rtsMode;
+        at<uint16_t>(0xb83ad6)=(uint16_t)savedBootstrap.participants;
+        at<unsigned char>(0xb83ad8)=0;
+        for(unsigned i=0;i<11;++i) {
+            memcpy(address(0xb83cdc+i*0x40c),savedBootstrap.slots[i],12);
+            at<unsigned char>(0xb83ce8+i*0x40c)=(unsigned char)savedBootstrap.slots[i][3];
+        }
+        memcpy((unsigned char*)self+0xc78,savedBootstrap.nativeOptions,16);
+        *(uint32_t*)((unsigned char*)self+0x664)=savedBootstrap.localPlayer;
+        at<uint32_t>(0xbed1e8)=savedBootstrap.seed;at<uint32_t>(0xb827dc)=savedBootstrap.randomCount;
+        at<uint32_t>(0xb3bae8)=savedBootstrap.tickInterval;
+        result=initializeMap(self,a,b);
+    } __finally {at<unsigned char>(0xb83ad0)=mode;}
+    } __except(EXCEPTION_EXECUTE_HANDLER) {invalidate(13);return 0;}
+    return result;
+}
+
 void legacyOptions(MatchSetup& setup) {
     // Standard custom-game options used by the native profile setup. Legacy
     // archives are accepted only if the original state/RNG checks also match.
@@ -209,10 +593,12 @@ void legacyOptions(MatchSetup& setup) {
 
 void restore();
 void showPlaybackNotice();
+void confirmPlaybackExit(HWND window);
 
 uint32_t __fastcall applicationHook(void* self,void*) {
-    if(playback && terminal.load() && !at<void*>(0xb8282c)) {
-        showPlaybackNotice();return applicationProcess(self);
+    if(playback && (exitConfirmationOpen || playbackExitRequested)) return 1;
+    if(playback && terminal.load()) {
+        showPlaybackNotice();return 1;
     }
     // 19 is the initialized main menu, measured in this exact Steam build.
     // Invoke the same viewport/loading and state transitions used by custom-game OK.
@@ -220,7 +606,15 @@ uint32_t __fastcall applicationHook(void* self,void*) {
         automaticStarted=true;
         memcpy(address(0xb83ad9),savedInitial.directory,256);
         memcpy(address(0xb83bd9),savedInitial.map,256);
-        if(!hasSetup) {
+        if(savedInitial.networkMode==1) {
+            if(!hasBootstrap) {invalidate(14);return applicationProcess(self);}
+            savedSetup={};savedSetup.version=2;savedSetup.rtsMode=1;savedSetup.localPlayer=savedBootstrap.localPlayer;
+            memcpy(savedSetup.nativeOptions,savedBootstrap.nativeOptions,16);
+            for(unsigned i=0;i<8;++i) {
+                savedSetup.players[i]=i<savedBootstrap.participants?0:1;
+                savedSetup.resources[i]=savedBootstrap.slots[i][1]==2000?1:0;
+            }
+        } else if(!hasSetup) {
             // Old archives lack menu settings. Infer the bounded default custom setup;
             // the original complete Initial comparison still refuses any mismatch.
             savedSetup={};savedSetup.version=1;savedSetup.rtsMode=1;
@@ -262,6 +656,21 @@ uint32_t __fastcall applicationHook(void* self,void*) {
 }
 
 LRESULT CALLBACK recordingWindowProc(HWND window,UINT message,WPARAM wparam,LPARAM lparam) {
+    if(playback && active && !terminal.load() && (message==WM_KEYDOWN || message==WM_KEYUP) && wparam==VK_ESCAPE) {
+        if(message==WM_KEYDOWN && !(lparam&(1L<<30)) && !exitConfirmationOpen && !playbackExitRequested) confirmPlaybackExit(window);
+        return 0;
+    }
+    if(playback && active && message==WM_KEYUP && (wparam=='I' || wparam=='U' || wparam=='1' || wparam=='2' || wparam=='4')) return 0;
+    if(playback && active && message==WM_KEYDOWN && !(lparam&(1L<<30))) {
+        if(wparam=='I') {showResources=!showResources;return 0;}
+        if(wparam=='U') {showObserverHud=!showObserverHud;return 0;}
+        if(wparam=='1' || wparam=='2' || wparam=='4') {
+            playbackClock();replaySpeed=(unsigned)(wparam-'0');return 0;
+        }
+    }
+    if(playback && active && message==WM_LBUTTONDOWN) {
+        if(selectObserverUnit((int16_t)LOWORD(lparam),(int16_t)HIWORD(lparam))) return 0;
+    }
     if(message==RecordPulse) {
         // Custom-game quit returns the map directory to the menu directory while
         // retaining the game object. A pause alone leaves the directory unchanged.
@@ -276,7 +685,9 @@ LRESULT CALLBACK recordingWindowProc(HWND window,UINT message,WPARAM wparam,LPAR
         // The writer completes asynchronously; no disk waits on the simulation thread.
         return 0;
     }
-    return CallWindowProcW(oldWindowProc,window,message,wparam,lparam);
+    LRESULT result=CallWindowProcW(oldWindowProc,window,message,wparam,lparam);
+    if(message==WM_NCDESTROY) windowDestroyed.store(true,std::memory_order_release);
+    return result;
 }
 
 BOOL CALLBACK findGameWindow(HWND window,LPARAM) {
@@ -315,18 +726,23 @@ uint32_t __fastcall replayQueuePop(void*,void*,void* bytes,uint32_t* metadata) {
     const auto& command=replayBatch[replayPop++];
     memcpy(bytes,command.bytes,command.header.size);*metadata=0;return command.header.size;
 }
+uint32_t __fastcall offlinePeerStatus(void*,void*,uint32_t) {return 0;}
 
 uint32_t dispatchReplay(void* self,uint32_t a,uint32_t b) {
     void* queue=at<void*>(0xb870c8);
     void*** object=reinterpret_cast<void***>(queue);
-    void** original=*object;void* replacement[12];
-    memcpy(replacement,original,sizeof(replacement));
+    void** original=*object;void* replacement[13]{};
+    memcpy(replacement,original,12*sizeof(void*));
     replacement[2]=(void*)replayQueuePop;replacement[4]=(void*)replayQueueCount;
+    // Native +0x30 checks live peer checksum reports. Playback instead validates
+    // every Before/After state against the authenticated recording.
+    replacement[12]=(void*)offlinePeerStatus;
+    unsigned char mode=at<unsigned char>(0xb83ad0);
     replayPop=0;replayApply=0;inDispatch=true;
     uint32_t result=1;
     // Preserve native command batching, bookkeeping and AI updates. Restore even on SEH.
-    __try {*object=replacement;result=advance(self,a,b);}
-    __finally {*object=original;inDispatch=false;}
+    __try {*object=replacement;if(savedInitial.networkMode==1) at<unsigned char>(0xb83ad0)=1;result=advance(self,a,b);}
+    __finally {*object=original;at<unsigned char>(0xb83ad0)=mode;inDispatch=false;}
     if(replayPop!=replayBatch.size() || replayApply!=replayBatch.size()) invalidate(8);
     return result;
 }
@@ -353,12 +769,22 @@ uint32_t __fastcall advanceHook(void* self,void*,uint32_t a,uint32_t b) {
     lastAdvanceAt.store(GetTickCount64());
     if(closePending.load()) return advance(self,a,b);
     if(failed.load()) return playback?1:advance(self,a,b);
-    // Multiplayer recording/replay is deliberately disabled until host latency and sync are measured.
-    if(at<unsigned char>(0xb83ad0)!=0) {
+    // Both native branches dispatch here after queue synchronization. The network
+    // branch sorts commands by participant before calling our command hook.
+    // Observe that order without replacing the network queue or changing its mode.
+    unsigned char networkMode=at<unsigned char>(0xb83ad0);
+    if(!playback && active && initial.networkMode!=networkMode) finish(self);
+    if(networkMode>1 || (playback && networkMode!=0)) {
         if(active) {invalidate(5);active=false;}
         return advance(self,a,b);
     }
     if(!producer) producer=GetCurrentThreadId();
+    if(playback && savedInitial.networkMode==1) {
+        const unsigned char* upcoming=nullptr;uint32_t size=0;
+        uint32_t expected=savedInitial.state.tick;
+        if(active && (getRecord(Before,upcoming,size,false) || getRecord(End,upcoming,size,false)) && size==sizeof(State)) expected=((const State*)upcoming)->tick;
+        if(at<uint32_t>(0xb8a280)<expected) return 1;
+    }
     State state{};
     if(!snapshot(self,state)) {invalidate(3);return advance(self,a,b);}
     if(!active) {
@@ -369,20 +795,33 @@ uint32_t __fastcall advanceHook(void* self,void*,uint32_t a,uint32_t b) {
             const Initial* saved=reinterpret_cast<const Initial*>(p);
             // Automatic bootstrap must produce the original game-native initial state.
             // It never overwrites arbitrary state or RNG to conceal a mismatch.
-            if(memcmp(saved,&initial,sizeof(Initial))) {invalidate(7);return 1;}
+            Initial comparable=initial;
+            if(saved->networkMode==1 && hasBootstrap) comparable.networkMode=1;
+            if(memcmp(saved,&comparable,sizeof(Initial))) {
+                for(unsigned offset=0;offset<sizeof(Initial);offset+=4) {
+                    uint32_t expected,actual;memcpy(&expected,(const char*)saved+offset,4);memcpy(&actual,(const char*)&comparable+offset,4);
+                    if(expected!=actual) {char line[160];sprintf_s(line,"Initial mismatch offset=%u expected=%u actual=%u",offset,expected,actual);log(line);}
+                }
+                invalidate(7);return 1;
+            }
             if(nextKind(Setup) && (!getRecord(Setup,p,n) || (n!=84 && n!=sizeof(MatchSetup)))) {invalidate(6);return 1;}
+            if(nextKind(Bootstrap) && (!getRecord(Bootstrap,p,n) || n!=sizeof(NetworkBootstrap))) {invalidate(6);return 1;}
         } else {
             MatchSetup setup{};captureSetup(self,setup);
+            bootstrapEmitted=false;
             emit(Begin,&initial,sizeof(initial));
-            if(validSetup(setup)) emit(Setup,&setup,sizeof(setup));
+            // Custom-menu globals do not describe the multiplayer lobby.
+            if(networkMode==0 && validSetup(setup)) emit(Setup,&setup,sizeof(setup));
+            if(networkMode==1 && hasCapturedBootstrap) {emit(Bootstrap,&capturedBootstrap,sizeof(capturedBootstrap));bootstrapEmitted=true;}
         }
         active=true;++session;frames=0;
     }
     if(!playback) {
         lastBefore=state;
         emit(Before,&state,sizeof(state));inDispatch=true;
-        uint32_t result=advance(self,a,b);
-        inDispatch=false;
+        uint32_t result=1;
+        __try {result=advance(self,a,b);}
+        __finally {inDispatch=false;}
         if(!snapshot(self,state)) invalidate(3);
         else emit(After,&state,sizeof(state));
         ++frames;return result;
@@ -396,7 +835,11 @@ uint32_t __fastcall advanceHook(void* self,void*,uint32_t a,uint32_t b) {
     if(!getRecord(Before,p,n) || n!=sizeof(State) || !same(state,*reinterpret_cast<const State*>(p))) {invalidate(8);return 1;}
     if(!discardLiveQueue()) {invalidate(9);return 1;}
     replayBatch.clear();
-    while(nextKind(Command)) {
+    while(nextKind(Command) || nextKind(Bootstrap)) {
+        if(nextKind(Bootstrap)) {
+            if(!getRecord(Bootstrap,p,n) || n!=sizeof(NetworkBootstrap)) {invalidate(6);return 1;}
+            continue;
+        }
         if(!getRecord(Command,p,n) || n<sizeof(CommandHeader)) {invalidate(6);return 1;}
         const CommandHeader* h=reinterpret_cast<const CommandHeader*>(p);
         if(h->size<2 || h->size>MaxCommand || n!=sizeof(*h)+h->size || replayBatch.size()>=4096) {invalidate(6);return 1;}
@@ -439,22 +882,94 @@ void restore() {
     ReleaseSRWLockExclusive(&codeLock);
 }
 
+struct DialogCursor {
+    RECT clip{};
+    bool clipped=false;
+    int increments=0;
+    HCURSOR previous=nullptr;
+    DialogCursor() {
+        clipped=GetClipCursor(&clip)!=FALSE;
+        ClipCursor(nullptr);
+        // KUF draws its own cursor; its render loop stops during a modal dialog.
+        do { ++increments; } while(ShowCursor(TRUE)<0);
+        previous=SetCursor(LoadCursorW(nullptr,MAKEINTRESOURCEW(32512)));
+    }
+    ~DialogCursor() {
+        SetCursor(previous);
+        while(increments>0) {ShowCursor(FALSE);--increments;}
+        if(clipped) ClipCursor(&clip);
+    }
+};
+
+void confirmPlaybackExit(HWND window) {
+    // Freeze the virtual simulation clock as well as reentrant modal processing.
+    playbackClock();exitConfirmationOpen=true;
+    int answer;
+    { DialogCursor cursor;answer=MessageBoxW(window,L"리플레이를 종료하시겠습니까?",L"KUF Replay",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2); }
+    using Timer=uint32_t(__stdcall*)();
+    clockWall=((Timer)at<void*>(0xa16cfc))();
+    exitConfirmationOpen=false;
+    if(answer==IDYES) {playbackExitRequested=true;restore();PostQuitMessage(0);}
+}
+
 void showPlaybackNotice() {
         static bool shown=false;
         if(!shown) {
             shown=true;
-            const wchar_t* prompt=notice.load()==13?L"이 기록의 지도 또는 경기 설정을 자동으로 복원할 수 없습니다. 최신 런처로 새 경기를 기록해 주세요. 종료하시겠습니까?":
+            const wchar_t* prompt=notice.load()==14?L"멀티플레이 초기화 데이터가 없는 이전 기록입니다. 새 런처로 경기를 다시 기록해 주세요. 종료하시겠습니까?":
+                notice.load()==13?L"이 기록의 지도 또는 경기 설정을 자동으로 복원할 수 없습니다. 최신 런처로 새 경기를 기록해 주세요. 종료하시겠습니까?":
                 failed.load()?L"기록 상태와 다른 상태를 발견해 재생을 중단했습니다. 종료하시겠습니까?":L"재생이 끝났습니다. 종료하시겠습니까?";
-            if(MessageBoxW(GetActiveWindow(),prompt,L"KUF Replay",MB_YESNO|MB_ICONQUESTION)==IDYES) {
+            int answer;
+            { DialogCursor dialogCursor; answer=MessageBoxW(GetActiveWindow(),prompt,L"KUF Replay",MB_YESNO|MB_ICONQUESTION); }
+            if(answer==IDYES) {
                 restore();PostQuitMessage(0);
             }
         }
 }
 
+uint32_t __fastcall replayQueueTick(void*,void*,uint32_t) {return at<uint32_t>(0xb8a280);}
+
 uint32_t __fastcall processHook(void* self,void*) {
+    if(playback && (exitConfirmationOpen || playbackExitRequested)) return 1;
     if(playback && terminal.load()) {
         showPlaybackNotice();
         return 1;
+    }
+    if(playback && savedInitial.networkMode==1 && !restoredEmptyNetworkInitial &&
+       savedInitial.state.seed==0 && savedInitial.state.randomCount==0 && savedInitial.state.checksum==0) {
+        void* units=at<void*>(0xb870c0);
+        State empty{};
+        if(!units || *(uint32_t*)((char*)units+0xdc38)!=0 || !snapshot(self,empty) ||
+           empty.randomCount!=0 || empty.checksum!=empty.seed) {invalidate(13);return 1;}
+        // Restore the recorded EMPTY pre-map checkpoint before any simulation.
+        // The offline custom loader writes default seed 999 and AI slot settings.
+        for(unsigned i=0;i<11;++i) memcpy(address(0xb83cdc+i*0x40c),savedInitial.slots[i],12);
+        at<uint32_t>(0xbed1e8)=0;at<uint32_t>(0xb827dc)=0;
+        at<uint32_t>(0xb8a280)=0;
+        at<uint32_t>(0xb3bae8)=savedBootstrap.tickInterval;
+        restoredEmptyNetworkInitial=true;
+        log("Restored verified empty pre-map network checkpoint before simulation.");
+    }
+    if(playback && savedInitial.networkMode==1) {
+        // Offline queue batches every three ticks; network recordings batch at
+        // other boundaries. Poll every simulation tick and let advanceHook wait
+        // for the exact recorded boundary, preserving intervening world updates.
+        void* queue=at<void*>(0xb870c8);
+        if(!queue) {invalidate(9);return 1;}
+        auto object=(void***)queue;void** original=*object;void* replacement[13];
+        memcpy(replacement,original,sizeof(replacement));replacement[6]=(void*)replayQueueTick;
+        uint32_t result=1;
+        uint16_t speedIndex=at<uint16_t>(0xb3baf4);
+        if(speedIndex>5) {invalidate(13);return 1;}
+        uint16_t& batchInterval=at<uint16_t>(0xb3baf8+speedIndex*2);
+        uint16_t originalInterval=batchInterval;
+        __try {
+            *object=replacement;batchInterval=1;
+            unsigned steps=0;
+            do {result=process(self);++steps;} while(!terminal.load() && clockValue<clockTarget && steps<64);
+        }
+        __finally {*object=original;batchInterval=originalInterval;}
+        return result;
     }
     return process(self);
 }
@@ -544,7 +1059,31 @@ bool readInput(const wchar_t* path) {
             memcpy(&savedSetup,p,size);if(size==84) legacyOptions(savedSetup);
             hasSetup=validSetup(savedSetup);if(!hasSetup) return false;
         }
-        if(!memchr(savedInitial.directory,0,256) || !memchr(savedInitial.map,0,256) || savedInitial.networkMode) return false;
+        if(nextKind(Bootstrap)) {
+            if(!getRecord(Bootstrap,p,size) || size!=sizeof(savedBootstrap) || savedInitial.networkMode!=1) return false;
+            memcpy(&savedBootstrap,p,size);hasBootstrap=validBootstrap(savedBootstrap);if(!hasBootstrap) return false;
+        }
+        if(savedInitial.networkMode==1 && !hasBootstrap) {
+            size_t scan=8;
+            while(scan+sizeof(Record)<=input.size()) {
+                Record record{};memcpy(&record,input.data()+scan,sizeof(record));scan+=sizeof(record);
+                if(record.size>4096 || scan+record.size>input.size()) return false;
+                if(record.kind==Bootstrap) {
+                    if(hasBootstrap || record.size!=sizeof(savedBootstrap)) return false;
+                    memcpy(&savedBootstrap,input.data()+scan,sizeof(savedBootstrap));
+                    hasBootstrap=validBootstrap(savedBootstrap);if(!hasBootstrap) return false;
+                }
+                scan+=record.size;
+            }
+            if(scan!=input.size()) return false;
+        }
+        if(!memchr(savedInitial.directory,0,256) || !memchr(savedInitial.map,0,256) || savedInitial.networkMode>1 ||
+           (savedInitial.networkMode==1 && !hasBootstrap)) return false;
+        if(input.size()<sizeof(Record)+sizeof(State)) return false;
+        Record ending{};memcpy(&ending,input.data()+input.size()-sizeof(Record)-sizeof(State),sizeof(ending));
+        if(ending.kind!=End || ending.size!=sizeof(State)) return false;
+        memcpy(&savedEnd,input.data()+input.size()-sizeof(State),sizeof(savedEnd));
+        if(savedEnd.tick<savedInitial.state.tick) return false;
         cursor=8;
     }
     return ok;
@@ -591,7 +1130,7 @@ DWORD WINAPI worker(void* argument) {
             CONTEXT context{};context.ContextFlags=CONTEXT_CONTROL;
             if(!GetThreadContext(h,&context)) ok=false;
             // Do not replace a prologue already being executed by another thread.
-            for(uint32_t va:{0x4cf2b0u,0x4c09f0u,0x7245d0u}) {
+            for(uint32_t va:{0x4cf2b0u,0x4c09f0u,0x7245d0u,0x525c30u,0x4c6a70u,0x4ced30u,0x4c77d0u}) {
                 uintptr_t p=(uintptr_t)address(va);
                 if(context.Eip>p && context.Eip<p+6) ok=false;
             }
@@ -605,17 +1144,53 @@ DWORD WINAPI worker(void* argument) {
         const uint32_t resets[]={0x58f313,0x58f981,0x596894,0x596a44,0x59737e,0x597de3};
         for(auto va:resets) if(ok) ok=patchCall(va,0x4d6d10,(void*)resetHook);
         const unsigned char procPrefix[]={0x55,0x8b,0xec,0x6a,0xff};
+        if(ok) {initializeMap=(Advance)patchEntry(0x4c77d0,procPrefix,sizeof(procPrefix),(void*)initializeMapHook);ok=initializeMap!=nullptr;}
         const unsigned char destroyPrefix[]={0x55,0x8b,0xec,0x56,0x8b,0xf1};
         if(ok) {process=reinterpret_cast<Process>(patchEntry(0x4cf2b0,procPrefix,sizeof(procPrefix),(void*)processHook));ok=process!=nullptr;}
         if(ok) {destroy=reinterpret_cast<Destroy>(patchEntry(0x4c09f0,destroyPrefix,sizeof(destroyPrefix),(void*)destroyHook));ok=destroy!=nullptr;}
         if(ok) {resultRender=reinterpret_cast<Process>(patchEntry(0x7245d0,procPrefix,sizeof(procPrefix),(void*)resultRenderHook));ok=resultRender!=nullptr;}
         if(ok && playback) {applicationProcess=reinterpret_cast<Process>(address(0x593f80));ok=patchCall(0x4fee4b,0x593f80,(void*)applicationHook);}
         if(ok && playback) {
+            // Offline loading has no peer start timestamp (+9f0/+9f4). Skip only
+            // the network loading-time diagnostic, never map/unit initialization.
+            const unsigned char timingBranch[]={0x75,0x66};
+            if(!memcmp(address(0x4c8db9),timingBranch,2)) ok=change((unsigned char*)address(0x4c8db9),{0xeb,0x66});
+            else ok=false;
+            const unsigned char selectionPrefix[]={0x55,0x8b,0xec,0xff,0x75,0x20};
+            if(ok) originalSelection=(Selection)patchEntry(0x525c30,selectionPrefix,sizeof(selectionPrefix),(void*)selectionHook);
+            ok=ok && originalSelection!=nullptr;
             unsigned char renderPrefix[]={0x56,0x57,0x8b,0x3d,0,0,0,0};
             uint32_t timer=static_cast<uint32_t>((uintptr_t)address(0xa16cfc));memcpy(renderPrefix+4,&timer,4);
-            prepareDisplay=reinterpret_cast<Process>(patchEntry(0x4c6a70,renderPrefix,sizeof(renderPrefix),(void*)prepareDisplayHook));ok=prepareDisplay!=nullptr;
+            if(ok) {prepareDisplay=reinterpret_cast<Process>(patchEntry(0x4c6a70,renderPrefix,sizeof(renderPrefix),(void*)prepareDisplayHook));ok=prepareDisplay!=nullptr;}
             const unsigned char drawPrefix[]={0x55,0x8b,0xec,0x83,0xec,0x54};
             if(ok) {drawDisplay=reinterpret_cast<Process>(patchEntry(0x4ced30,drawPrefix,sizeof(drawPrefix),(void*)drawDisplayHook));ok=drawDisplay!=nullptr;}
+            if(ok) {interfaceRender=(Process)address(0x4d5f00);ok=patchCall(0x4c6b78,0x4d5f00,(void*)interfaceHook);}
+            if(ok) ok=patchCall(0x5056d5,0x512a00,(void*)observerSelectionSync);
+            const unsigned char audioPrefix[]={0x55,0x8b,0xec,0x83,0xe4,0xf8};
+            if(ok) {spatialAudio=(Audio)patchEntry(0x540e70,audioPrefix,sizeof(audioPrefix),(void*)spatialAudioHook);ok=spatialAudio!=nullptr;}
+            if(ok) {spatialLoopAudio=(Audio)patchEntry(0x5410a0,audioPrefix,sizeof(audioPrefix),(void*)spatialLoopAudioHook);ok=spatialLoopAudio!=nullptr;}
+            if(ok) ok=patchCall(0x540eb0,0x4369f0,(void*)observerAudioVisibility);
+            if(ok) ok=patchCall(0x5410e0,0x4369f0,(void*)observerAudioVisibility);
+            const unsigned char panelCall[]={0x8b,0x01,0xff,0x50,0x10};
+            if(ok && !memcmp(address(0x4d6c38),panelCall,sizeof(panelCall))) {
+                std::vector<unsigned char> bytes={0xe8,0,0,0,0};
+                int32_t delta=(int32_t)((uintptr_t)observerPanelHook-(uintptr_t)address(0x4d6c38)-5);
+                memcpy(bytes.data()+1,&delta,4);ok=change((unsigned char*)address(0x4d6c38),bytes);
+            } else ok=false;
+            const unsigned char layerCall[]={0x8b,0x01,0xff,0x50,0x08};
+            if(ok && !memcmp(address(0x49e452),layerCall,sizeof(layerCall))) {
+                std::vector<unsigned char> bytes={0xe8,0,0,0,0};
+                int32_t delta=(int32_t)((uintptr_t)observerLayerHook-(uintptr_t)address(0x49e452)-5);
+                memcpy(bytes.data()+1,&delta,4);ok=change((unsigned char*)address(0x49e452),bytes);
+            } else ok=false;
+            // Only CGame::Process uses this timer. Rendering continues using real time.
+            unsigned char clockPrefix[]={0xa1,0,0,0,0};
+            uint32_t timerSlot=(uint32_t)(uintptr_t)address(0xa16cfc);memcpy(clockPrefix+1,&timerSlot,4);
+            if(ok && !memcmp(address(0x4cf302),clockPrefix,sizeof(clockPrefix))) {
+                std::vector<unsigned char> bytes={0xb8,0,0,0,0};
+                uint32_t callback=(uint32_t)(uintptr_t)playbackClock;memcpy(bytes.data()+1,&callback,4);
+                ok=change((unsigned char*)address(0x4cf302),bytes);
+            } else ok=false;
             // These four native input senders already return without dispatch in
             // the game's own playback mode. Camera processing is left intact.
             unsigned char inputPrefix[]={0x55,0x8b,0xec,0x80,0x3d,0,0,0,0,0x01};
@@ -632,12 +1207,12 @@ DWORD WINAPI worker(void* argument) {
     else GetEnvironmentVariableW(L"KUF_REPLAY_READY",buffer,32768);
     HANDLE event=OpenEventW(EVENT_MODIFY_STATE,FALSE,buffer);if(event) {SetEvent(event);CloseHandle(event);}
     if(!ok) return 1;
-    log(playback?"Playback adapter ready. Automatic custom-game setup and spectator display enabled.":"Recording adapter ready. Single-player only; multiplayer intentionally excluded.");
+    log(playback?"Playback adapter ready. Automatic single-player/network bootstrap and spectator display enabled.":"Recording adapter ready. Single-player and multiplayer capture with network bootstrap enabled.");
     HANDLE file=INVALID_HANDLE_VALUE;std::wstring partial;uint32_t fileBytes=0,number=0;
     uint32_t lastFrameOffset=0,writtenFrames=0;State writerBefore{};
     ULONGLONG checkAt=GetTickCount64(),pulseAt=0;int lastNotice=0;
     for(;;) {
-        if(!playback && !gameWindow) {
+        if(!gameWindow) {
             EnumWindows(findGameWindow,0);
             if(gameWindow) {
                 oldWindowProc=(WNDPROC)GetWindowLongPtrW(gameWindow,GWLP_WNDPROC);
@@ -650,12 +1225,27 @@ DWORD WINAPI worker(void* argument) {
             pulseAt=GetTickCount64();PostMessageW(gameWindow,RecordPulse,0,0);
         }
         uint32_t t=tail.load(std::memory_order_relaxed),h=head.load(std::memory_order_acquire);
+        if(windowDestroyed.load(std::memory_order_acquire) && t==h) {
+            if(file!=INVALID_HANDLE_VALUE) {FlushFileBuffers(file);CloseHandle(file);}
+            log("Game window destroyed; engine worker stopped.");
+            return 0;
+        }
         if(h-t>=sizeof(Record)) {
             Record record{};readRing(t,&record,sizeof(record));
             unsigned char payload[4096];
             if(record.size>sizeof(payload) || h-t<sizeof(record)+record.size) {invalidate(6);break;}
             readRing(t+sizeof(record),payload,record.size);
+            if(record.kind==Bootstrap && record.size==sizeof(NetworkBootstrap)) {
+                NetworkBootstrap boot{};memcpy(&boot,payload,sizeof(boot));
+                char details[256]{};
+                sprintf_s(details,"Network bootstrap captured: valid=%u, participants=%u, local=%u, RTS=%u, scenario=%u, interval=%u, first-controller=%u",validBootstrap(boot),boot.participants,boot.localPlayer,boot.rtsMode,boot.scenarioMode,boot.tickInterval,boot.slots[0][0]);
+                log(details);
+            }
             if(record.kind==Begin) {
+                if(record.size==sizeof(Initial)) {
+                    Initial captured{};memcpy(&captured,payload,sizeof(captured));
+                    log(captured.networkMode==1?"Multiplayer match capture started: native synchronized command application order.":"Single-player match capture started.");
+                }
                 if(file!=INVALID_HANDLE_VALUE) CloseHandle(file);
                 partial=inbox+L"\\"+std::to_wstring(GetCurrentProcessId())+L"_"+std::to_wstring(++number)+L".partial";
                 file=CreateFileW(partial.c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
@@ -695,7 +1285,7 @@ DWORD WINAPI worker(void* argument) {
         } else Sleep(10);
         if(closePending.load() && failed.load() && !closeReady.exchange(true)) PostMessageW(gameWindow,WM_CLOSE,0,0);
         int issue=notice.load();
-        if(issue!=lastNotice) {char line[100];wsprintfA(line,"Engine status code: %d (see docs/ENGINE_NATIVE.md)",issue);log(line);lastNotice=issue;}
+        if(issue!=lastNotice) {char line[100];wsprintfA(line,"Engine status code: %d (see docs/ENGINE_NATIVE.md)",issue);log(line);if(playback && issue==10){wsprintfA(line,"Observer spatial audio callbacks: %u",observerAudioCalls.load());log(line);}lastNotice=issue;}
         if(GetTickCount64()-checkAt>2000 && !terminal.load()) {
             checkAt=GetTickCount64();
             if(file!=INVALID_HANDLE_VALUE && !failed.load() && !FlushFileBuffers(file)) invalidate(11);

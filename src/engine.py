@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from replay_store import Store, validate, REQUIRED, ALLOWED, MAX_TOTAL, MAX_MANIFEST, atomic_json
+from updater import VERSION
 
 ADAPTER = 'kuf-steam-1.416-experimental-v1'
 GAME_HASH = '69f2575ad14c78d3c6f7c15d0187234be005f06abf095d3f1bd602f1c3722868'
@@ -24,7 +25,16 @@ MAX_TRACE = 128 * 1024 * 1024
 STATE = struct.Struct('<4I')
 INITIAL_SIZE = 664
 SETUP = struct.Struct('<21I')
+BOOTSTRAP = struct.Struct('<52I16s')
 COMMAND = struct.Struct('<4I')
+
+def replay_time(metadata):
+    """Supported KUF builds advance one simulation tick every 30 milliseconds."""
+    if metadata.get('adapter_id') == ADAPTER and metadata.get('game_sha256') == GAME_HASH:
+        seconds = metadata['ticks'] * metadata.get('tick_interval_ms',30) // 1000
+    else:
+        seconds = metadata['ticks'] // metadata['tick_rate']
+    return f'{seconds // 60}:{seconds % 60:02d}'
 
 @dataclass(frozen=True)
 class Trace:
@@ -34,6 +44,7 @@ class Trace:
     commands: int
     raw: bytes
     setup: bytes | None = None
+    bootstrap: bytes | None = None
 
     @property
     def map_name(self):
@@ -43,12 +54,16 @@ class Trace:
     def map_directory(self):
         return self.initial[20:276].split(b'\0')[0].decode('cp949')
 
+    @property
+    def network_mode(self):
+        return struct.unpack_from('<I',self.initial,16)[0]
+
 def parse_trace(raw):
     if len(raw) > MAX_TRACE or not raw.startswith(MAGIC):
         raise ValueError('기록 크기 또는 형식 오류')
     offset, initial, pending, final = 8, None, None, None
     frames, commands, last_tick = [], 0, -1
-    setup = None
+    setup, bootstrap = None, None
     while offset < len(raw):
         if offset + 8 > len(raw):
             raise ValueError('잘린 기록 헤더')
@@ -64,8 +79,8 @@ def parse_trace(raw):
             if initial is not None or length != INITIAL_SIZE:
                 raise ValueError('초기 상태 오류')
             initial = payload
-            if struct.unpack_from('<I', initial, 16)[0] != 0:
-                raise ValueError('현재 어댑터는 싱글플레이만 지원합니다')
+            if struct.unpack_from('<I', initial, 16)[0] not in (0,1):
+                raise ValueError('지원하지 않는 네트워크 경기 모드')
             # Game filenames must be bounded, terminated strings.
             for segment in (initial[20:276], initial[276:532]):
                 if b'\0' not in segment:
@@ -75,9 +90,26 @@ def parse_trace(raw):
             if initial is None or setup is not None or pending is not None or frames or length not in (SETUP.size, SETUP.size+16):
                 raise ValueError('자동 경기 설정 순서/크기 오류')
             values=SETUP.unpack(payload[:SETUP.size])
-            if values[0] not in (1,2) or values[1:3] != (0,1) or values[3]>5 or values[4]>=8 or any(v>1 for v in values[5:13]) or any(v>3 for v in values[13:]) or values[5+values[4]]!=0 or (values[0]==2 and length!=100) or any(v>2 for v in payload[84:96]):
+            if values[0] not in (1,2) or values[1:3] != (0,1) or values[3]>5 or values[4]>=8 or any(v>1 for v in values[5:13]) or any(v>3 for v in values[13:]) or values[5+values[4]]!=0 or (values[0]==2 and length!=100) or any(v>2 for v in payload[84:93]):
                 raise ValueError('지원하지 않는 자동 경기 설정')
             setup=payload
+        elif kind == 8:
+            if initial is None or struct.unpack_from('<I',initial,16)[0]!=1 or bootstrap is not None or length!=BOOTSTRAP.size:
+                raise ValueError('멀티 초기화 데이터 순서/크기 오류')
+            if pending is None and frames:
+                raise ValueError('멀티 초기화 데이터가 경기 배치 밖에 있습니다')
+            if pending is not None and (not pending[1] or len(pending[1][-1][3])!=96 or struct.unpack_from('<H',pending[1][-1][3])[0]!=1007):
+                raise ValueError('멀티 초기화 데이터가 지도 초기화 명령 뒤에 있지 않습니다')
+            values=BOOTSTRAP.unpack(payload)
+            if (values[0]!=1 or values[1:3]!=(0,1) or not 1<=values[3]<=11 or values[4]>=8 or
+                not 1<=values[7]<=1000 or any(v>2 for v in values[-1][:9])):
+                raise ValueError('지원하지 않는 멀티 초기화 설정')
+            for i in range(11):
+                controller,race,descriptor,ready=values[8+i*4:12+i*4]
+                # Native auxiliary slot 10 is assigned a controller by map initialization.
+                if (i<10 and controller>3) or race not in (1000,2000,3000,4000) or descriptor>65535 or ready>1:
+                    raise ValueError('손상된 멀티 참가자 설정')
+            bootstrap=payload
         elif kind == 2:
             if initial is None or pending is not None or length != STATE.size:
                 raise ValueError('틱 시작 순서 오류')
@@ -114,7 +146,7 @@ def parse_trace(raw):
             raise ValueError('알 수 없는 기록 종류')
     if initial is None or final is None:
         raise ValueError('미완성 경기 기록')
-    return Trace(initial, tuple(frames), final, commands, raw, setup)
+    return Trace(initial, tuple(frames), final, commands, raw, setup, bootstrap)
 
 def native_dir():
     if getattr(sys, 'frozen', False):
@@ -169,18 +201,26 @@ def package_capture(source, game, store, recovery=None):
     contents['checksums.bin'] = b''.join(struct.pack('<2I',frame[0][0],frame[0][3]) for frame in trace.frames)
     hashes = {name:hashlib.sha256(data).hexdigest() for name,data in contents.items()}
     stamp = datetime.fromtimestamp(source.stat().st_mtime,timezone.utc).isoformat()
+    interval=BOOTSTRAP.unpack(trace.bootstrap)[7] if trace.bootstrap else 30
+    playable=not trace.network_mode or trace.bootstrap is not None
     metadata = {'format_version':1, 'complete':True, 'game_sha256':GAME_HASH,
                 'rules_sha256':RULES, 'map_sha256':hashes['map.bin'], 'game_version':'Steam 1.416',
                 'rules_version':'native-v1-experimental', 'adapter_id':ADAPTER, 'recorded_at':stamp,
+                'recorder_version':VERSION,
                 'map_id':trace.map_name, 'ticks':max(1,trace.final[0]-trace.frames[0][0][0]+1),
-                'tick_rate':25, 'duration_verified':False, 'hashes':hashes,
+                'tick_rate':max(1,1000//interval), 'tick_interval_ms':interval, 'duration_verified':True, 'hashes':hashes,
                 'frame_count':len(trace.frames), 'command_count':trace.commands,
-                'initial_restore':'automatic-native-setup' if trace.setup else 'verified-legacy-defaults',
+                'initial_restore':('automatic-network-bootstrap' if trace.bootstrap else
+                                   'multiplayer-lobby-restore-required' if trace.network_mode else
+                                   'automatic-native-setup' if trace.setup else 'verified-legacy-defaults'),
                 'setup_version':struct.unpack_from('<I',trace.setup)[0] if trace.setup else 0,
-                'multiplayer_supported':False}
+                'network_mode':trace.network_mode,
+                'recording_mode':'multiplayer' if trace.network_mode else 'singleplayer',
+                'playback_supported':playable,
+                'multiplayer_supported':bool(trace.bootstrap)}
     if recovery:
         metadata['recovery']=recovery
-    # Tick rate remains an estimate pending runtime measurement. UI does not show a false time.
+    # Exact time uses tick_interval_ms; tick_rate is retained for format-v1 readers.
     metadata['local_signature'] = _signature(_key(store.root,create=True),metadata)
     temp = store.root / (uuid.uuid4().hex+'.partial')
     try:
@@ -255,6 +295,8 @@ def stage_playback(path, game, store):
         trace = parse_trace(raw)
         if z.read('initial.bin') != trace.initial:
             raise ValueError('초기 상태와 명령 기록 불일치')
+        if trace.network_mode and trace.bootstrap is None:
+            raise ValueError('이 기록에는 지도 초기화 설정이 누락되어 있습니다. 0.2.11의 수집 시점 오류로 생성된 기록도 해당합니다. 0.2.12 이상 런처로 새 경기를 기록해 주세요.')
         expected_rng=b''.join(struct.pack('<3I',*frame[0][:3]) for frame in trace.frames)
         expected_checksums=b''.join(struct.pack('<2I',frame[0][0],frame[0][3]) for frame in trace.frames)
         if z.read('rng.bin')!=expected_rng or z.read('checksums.bin')!=expected_checksums:
@@ -312,7 +354,19 @@ def collect_completed(game, store):
 def _collect_completed(game, store):
     result, errors=[], []
     recovered_sources={m.get('recovery',{}).get('source') for _,m,_ in store.listing()}
-    for source in (store.root/'CaptureInbox').glob('*.partial.complete'):
+    inbox=store.root/'CaptureInbox'
+    sources=list(inbox.glob('*.partial.complete'))
+    # Revalidate captures rejected by 0.2.12's auxiliary-slot enum check.
+    # Other rejected files stay quarantined; package_capture validates all data again.
+    for source in inbox.glob('*.partial.complete.rejected'):
+        try:
+            reason=json.loads(source.with_suffix(source.suffix+'.json').read_text(encoding='utf-8'))
+            if reason.get('error') in ('손상된 멀티 참가자 설정','지원하지 않는 멀티 초기화 설정'):
+                parse_trace(source.read_bytes())
+                sources.append(source)
+        except (ValueError,OSError,UnicodeError):
+            continue
+    for source in sources:
         try:
             result.append(package_capture(source,game,store))
         except (ValueError,OSError,UnicodeError,zipfile.BadZipFile) as error:

@@ -9,6 +9,7 @@
 #include <cstdio>
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "user32.lib")
 
 static bool knownGame(const wchar_t* path) {
     HANDLE f=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr);
@@ -52,6 +53,102 @@ static DWORD gamePid() {
     for(BOOL ok=Process32FirstW(s,&e);ok;ok=Process32NextW(s,&e))
         if(!_wcsicmp(e.szExeFile,L"KingdomUnderFire.exe")) {pid=e.th32ProcessID;break;}
     CloseHandle(s);return pid;
+}
+
+static bool imageMatches(HANDLE process,const std::wstring& path) {
+    wchar_t actual[32768]{};DWORD size=32768;
+    return QueryFullProcessImageNameW(process,0,actual,&size) && !_wcsicmp(actual,path.c_str());
+}
+static BOOL CALLBACK closeCompanionWindow(HWND window,LPARAM pid) {
+    DWORD owner=0;GetWindowThreadProcessId(window,&owner);
+    if(owner==(DWORD)pid) PostMessageW(window,WM_CLOSE,0,0);
+    return TRUE;
+}
+struct SessionWindow {DWORD pid;bool found;};
+static BOOL CALLBACK sessionWindow(HWND window,LPARAM data) {
+    auto state=(SessionWindow*)data;DWORD pid=0;GetWindowThreadProcessId(window,&pid);
+    wchar_t title[128]{};GetWindowTextW(window,title,128);
+    if(pid==state->pid && !wcscmp(title,L"Kingdom Under Fire") && !GetWindow(window,GW_OWNER)) state->found=true;
+    return TRUE;
+}
+struct SessionLock {
+    HANDLE handle;
+    SessionLock():handle(CreateMutexW(nullptr,FALSE,L"Local\\KUFReplayLaunchCleanup")) {
+        if(handle) WaitForSingleObject(handle,INFINITE);
+    }
+    ~SessionLock() {if(handle) {ReleaseMutex(handle);CloseHandle(handle);}}
+};
+static int watchSession(const wchar_t* gamePath,DWORD pid,const wchar_t* dataRoot) {
+    // Independent of the launcher and injected DLL: also handles Alt+F4/crash/forced exit.
+    HANDLE game=OpenProcess(SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION|PROCESS_VM_READ|PROCESS_TERMINATE,FALSE,pid);
+    if(!game || !imageMatches(game,gamePath)) {if(game) CloseHandle(game);return 1;}
+    HANDLE modules=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE,pid);MODULEENTRY32W module{};module.dwSize=sizeof(module);
+    uintptr_t gameBase=0;
+    for(BOOL more=Module32FirstW(modules,&module);more;more=Module32NextW(modules,&module)) {
+        if(!_wcsicmp(module.szExePath,gamePath)) {gameBase=(uintptr_t)module.modBaseAddr;break;}
+    }
+    if(modules!=INVALID_HANDLE_VALUE) CloseHandle(modules);
+    bool seenWindow=false;ULONGLONG vanished=0;
+    while(WaitForSingleObject(game,250)==WAIT_TIMEOUT) {
+        SessionWindow state{pid,false};EnumWindows(sessionWindow,(LPARAM)&state);
+        if(state.found) {seenWindow=true;vanished=0;}
+        else if(seenWindow) {
+            if(!vanished) vanished=GetTickCount64();
+            uint32_t object=1,manager=1;SIZE_T read=0;
+            // Only an already destroyed match and absent main window qualify for orphan cleanup.
+            if(gameBase && GetTickCount64()-vanished>=5000 &&
+               ReadProcessMemory(game,(void*)(gameBase+0xb8282c-0x400000),&object,4,&read) && read==4 && !object &&
+               ReadProcessMemory(game,(void*)(gameBase+0xb870c0-0x400000),&manager,4,&read) && read==4 && !manager) {
+                TerminateProcess(game,0);WaitForSingleObject(game,3000);break;
+            }
+        }
+    }
+    CloseHandle(game);
+    SessionLock lock;
+    std::wstring path=gamePath;
+    path=path.substr(0,path.find_last_of(L"\\/"))+L"\\LocusGameChain\\LocusGameChain.exe";
+    HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);
+    if(snapshot==INVALID_HANDLE_VALUE) return 1;
+    PROCESSENTRY32W entry{};entry.dwSize=sizeof(entry);
+    std::vector<std::pair<DWORD,HANDLE>> companions;
+    bool anotherGame=false;
+    for(BOOL more=Process32FirstW(snapshot,&entry);more;more=Process32NextW(snapshot,&entry)) {
+        if(!_wcsicmp(entry.szExeFile,L"KingdomUnderFire.exe")) {
+            HANDLE other=OpenProcess(SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION,FALSE,entry.th32ProcessID);
+            if(other) {anotherGame |= imageMatches(other,gamePath) && WaitForSingleObject(other,0)==WAIT_TIMEOUT;CloseHandle(other);}
+        } else if(!_wcsicmp(entry.szExeFile,L"LocusGameChain.exe")) {
+            HANDLE companion=OpenProcess(SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION|PROCESS_TERMINATE,FALSE,entry.th32ProcessID);
+            if(companion && imageMatches(companion,path)) companions.emplace_back(entry.th32ProcessID,companion);
+            else if(companion) CloseHandle(companion);
+        }
+    }
+    CloseHandle(snapshot);
+    for(const auto& companion:companions) {
+        if(!anotherGame) EnumWindows(closeCompanionWindow,(LPARAM)companion.first);
+    }
+    DWORD closed=0;
+    for(const auto& companion:companions) {
+        if(!anotherGame) {
+            // A held process handle prevents PID reuse from targeting an unrelated process.
+            if(WaitForSingleObject(companion.second,3000)==WAIT_TIMEOUT) TerminateProcess(companion.second,0);
+            if(WaitForSingleObject(companion.second,3000)==WAIT_OBJECT_0) ++closed;
+        }
+        CloseHandle(companion.second);
+    }
+    std::wstring logPath=std::wstring(dataRoot)+L"\\session-cleanup.log";
+    HANDLE log=CreateFileW(logPath.c_str(),FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_ALWAYS,0,nullptr);
+    if(log!=INVALID_HANDLE_VALUE) {
+        char line[160]{};sprintf_s(line,"Game PID %lu exited; same-installation LocusGameChain closed=%lu; another game=%d\r\n",pid,closed,anotherGame?1:0);
+        DWORD count=0;WriteFile(log,line,(DWORD)strlen(line),&count,nullptr);CloseHandle(log);
+    }
+    return 0;
+}
+static bool startWatcher(const wchar_t* game,DWORD pid,const wchar_t* dataRoot) {
+    wchar_t executable[32768]{};if(!GetModuleFileNameW(nullptr,executable,32768)) return false;
+    std::wstring command=L"\""+std::wstring(executable)+L"\" --watch \""+game+L"\" "+std::to_wstring(pid)+L" \""+dataRoot+L"\"";
+    STARTUPINFOW startup{};startup.cb=sizeof(startup);PROCESS_INFORMATION process{};
+    if(!CreateProcessW(executable,command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW|CREATE_NEW_PROCESS_GROUP,nullptr,nullptr,&startup,&process)) return false;
+    CloseHandle(process.hThread);CloseHandle(process.hProcess);return true;
 }
 
 static int steamRecord(wchar_t** argv) {
@@ -106,13 +203,20 @@ static int steamRecord(wchar_t** argv) {
     }
     CloseHandle(ready);CloseHandle(process);
     if(!ok) {fwprintf(stderr,L"Steam game started, but recording engine attachment failed. See engine.log. Game was not terminated.\n");return 6;}
+    if(!startWatcher(argv[1],pid,argv[3])) {fwprintf(stderr,L"Session exit watcher could not start.\n");return 7;}
     printf("%lu\n",pid);return 0;
 }
 
 int wmain(int argc,wchar_t** argv) {
+    if(argc==5 && !wcscmp(argv[1],L"--watch")) {
+        wchar_t* end=nullptr;unsigned long pid=wcstoul(argv[3],&end,10);
+        if(!pid || !end || *end || !knownGame(argv[2])) return 2;
+        return watchSession(argv[2],pid,argv[4]);
+    }
     // Only the launcher supplies these paths. Never loads a DLL contained in a replay.
     if(argc!=6) {fwprintf(stderr,L"Usage: injector GAME DLL ROOT record|play INPUT\n");return 2;}
     if(!knownGame(argv[1])) {fwprintf(stderr,L"Unsupported game SHA256. No process was patched.\n");return 3;}
+    SessionLock lock;
     if(gameRunning()) {fwprintf(stderr,L"Close the running game before starting a recorded session.\n");return 4;}
     if(!wcscmp(argv[4],L"steam-record") || !wcscmp(argv[4],L"steam-play")) return steamRecord(argv);
     if(wcscmp(argv[4],L"record") && wcscmp(argv[4],L"play")) return 2;
@@ -147,6 +251,7 @@ int wmain(int argc,wchar_t** argv) {
     }
     if(ok) {
         ResumeThread(pi.hThread);
+        startWatcher(argv[1],pi.dwProcessId,argv[3]);
         printf("%lu\n",pi.dwProcessId);
     } else {
         // This process has never run user/game code; terminate only this failed child.

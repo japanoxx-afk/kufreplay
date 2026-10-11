@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from replay_store import Store, validate, REQUIRED
 from updater import version_tuple
 
-def fixture(path, when='2026-10-11T12:00:00+09:00', extra=None, corrupt=False, complete=True):
+def fixture(path, when='2026-10-11T12:00:00+09:00', extra=None, corrupt=False, complete=True, metadata=None):
     contents = {name: (name + ' fixture data').encode() for name in REQUIRED}
     hashes = {name: hashlib.sha256(value).hexdigest() for name, value in contents.items()}
     m = {'format_version':1, 'complete':complete, 'game_sha256':'a'*64, 'rules_sha256':'b'*64,
@@ -19,6 +19,7 @@ def fixture(path, when='2026-10-11T12:00:00+09:00', extra=None, corrupt=False, c
          'hashes':hashes}
     if corrupt:
         contents['commands.bin'] = b'corrupt'
+    if metadata: m.update(metadata)
     with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as z:
         z.writestr('manifest.json', json.dumps(m))
         for name, value in contents.items():
@@ -27,6 +28,13 @@ def fixture(path, when='2026-10-11T12:00:00+09:00', extra=None, corrupt=False, c
             z.writestr(extra, b'bad')
 
 class StoreTests(unittest.TestCase):
+    def test_optional_tick_interval_validation(self):
+        for interval in ('30', True, 0, 1001):
+            fixture(self.source,metadata={'tick_interval_ms':interval})
+            with self.assertRaisesRegex(ValueError,'시간 간격'): validate(self.source)
+        fixture(self.source,metadata={'tick_interval_ms':54})
+        self.assertEqual(validate(self.source)['tick_interval_ms'],54)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

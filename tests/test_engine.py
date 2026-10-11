@@ -10,23 +10,146 @@ from unittest.mock import patch
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
 from engine import (MAGIC, STATE, INITIAL_SIZE, parse_trace, resolve_map, package_capture,
-                    stage_playback, collect_completed, recover_closed_capture, ADAPTER)
+                    stage_playback, collect_completed, recover_closed_capture, ADAPTER, GAME_HASH, replay_time, BOOTSTRAP)
 from replay_store import Store, validate
 
 def record(kind, payload):
     return struct.pack('<2I',kind,len(payload))+payload
 
-def fixture(directory=b'res\\map\\Skirmish\\', name=b'fixture.kfm'):
+def fixture(directory=b'res\\map\\Skirmish\\', name=b'fixture.kfm', network_mode=0):
     initial=bytearray(INITIAL_SIZE)
     before=(1,0,0,100)
     STATE.pack_into(initial,0,*before)
+    struct.pack_into('<I',initial,16,network_mode)
     initial[20:20+len(directory)]=directory
     initial[276:276+len(name)]=name
     return (MAGIC+record(1,initial)+record(2,STATE.pack(*before))+
             record(3,struct.pack('<4I',1,0,0,4)+b'\x05\x00\x00\x00')+
             record(4,STATE.pack(1,1,1,107))+record(5,STATE.pack(2,1,1,110)))
 
+def network_fixture():
+    values=[1,0,1,3,0,123,45,54]
+    for i in range(11): values.extend([1 if i==0 else 2,1000,1,1])
+    boot=BOOTSTRAP.pack(*values,b'\x01\x01\x00\x01'+bytes(12))
+    raw=fixture(network_mode=1);start=8+8+INITIAL_SIZE
+    return raw[:start]+record(8,boot)+raw[start:]
+
 class EngineTests(unittest.TestCase):
+    def test_network_bootstrap_and_validation(self):
+        raw=network_fixture();trace=parse_trace(raw)
+        self.assertEqual(len(trace.bootstrap),224)
+        self.assertEqual(BOOTSTRAP.unpack(trace.bootstrap)[7],54)
+        start=8+8+INITIAL_SIZE
+        for field,value in [(0,2),(3,12),(4,8),(7,0),(8,4),(9,999),(10,65536),(11,2)]:
+            bad=bytearray(raw);struct.pack_into('<I',bad,start+8+field*4,value)
+            with self.assertRaises(ValueError,msg=f'bootstrap field {field}'):
+                parse_trace(bad)
+        with self.assertRaises(ValueError):
+            parse_trace(raw[:start]+record(8,trace.bootstrap)+raw[start:])
+        single=bytearray(raw);struct.pack_into('<I',single,8+8+16,0)
+        with self.assertRaises(ValueError): parse_trace(single)
+
+    def test_network_options_padding_is_not_an_enum(self):
+        raw=bytearray(network_fixture()); start=8+8+INITIAL_SIZE+8
+        raw[start+217:start+220]=b'\xcd\xcd\xcd'
+        self.assertEqual(BOOTSTRAP.unpack(parse_trace(raw).bootstrap)[-1][9:12],b'\xcd\xcd\xcd')
+        raw[start+216]=205
+        with self.assertRaisesRegex(ValueError,'초기화 설정'): parse_trace(raw)
+
+    def test_network_auxiliary_slot_preserves_native_word(self):
+        raw=bytearray(network_fixture()); start=8+8+INITIAL_SIZE+8
+        struct.pack_into('<I',raw,start+(8+10*4)*4,1952796276)
+        self.assertEqual(BOOTSTRAP.unpack(parse_trace(raw).bootstrap)[48],1952796276)
+        struct.pack_into('<I',raw,start+(8+9*4)*4,1952796276)
+        with self.assertRaisesRegex(ValueError,'참가자 설정'): parse_trace(raw)
+
+    def test_deferred_network_bootstrap_after_start_command(self):
+        raw=fixture(network_mode=1);start=8+8+INITIAL_SIZE+8+STATE.size
+        boot=bytearray(parse_trace(network_fixture()).bootstrap)
+        struct.pack_into('<I',boot,8*4,3) # Observed real network controller enum.
+        packet=struct.pack('<H',1007)+bytes(94)
+        command=record(3,struct.pack('<4I',1,0,0,96)+packet)
+        late=raw[:start]+command+record(8,boot)+raw[start+8+20:]
+        trace=parse_trace(late)
+        self.assertEqual(trace.bootstrap,boot)
+        self.assertEqual(trace.commands,1)
+        with self.assertRaisesRegex(ValueError,'초기화 명령'):
+            parse_trace(raw[:start]+record(8,boot)+raw[start:])
+
+    def test_network_bootstrap_authenticated_staging(self):
+        with tempfile.TemporaryDirectory() as root:
+            root=Path(root);game=root/'game'/'KingdomUnderFire.exe'
+            game.parent.mkdir();game.write_bytes(b'fixture-executable')
+            maps=game.parent/'res'/'map'/'Skirmish';maps.mkdir(parents=True)
+            (maps/'fixture.kfm').write_bytes(b'fixture-map-data')
+            source=root/'capture.partial.complete';source.write_bytes(network_fixture())
+            store=Store(root/'library')
+            with patch('engine.GAME_HASH',hashlib.sha256(game.read_bytes()).hexdigest()):
+                replay=package_capture(source,game,store);metadata=validate(replay)
+                self.assertTrue(metadata['multiplayer_supported'])
+                self.assertTrue(metadata['playback_supported'])
+                self.assertEqual(metadata['initial_restore'],'automatic-network-bootstrap')
+                self.assertEqual(metadata['tick_interval_ms'],54)
+                staged,trace=stage_playback(replay,game,store)
+                self.assertEqual(staged.read_bytes(),network_fixture())
+                self.assertIsNotNone(trace.bootstrap)
+    def test_recollect_auxiliary_slot_rejection_once(self):
+        with tempfile.TemporaryDirectory() as root:
+            root=Path(root);game=root/'game'/'KingdomUnderFire.exe'
+            game.parent.mkdir();game.write_bytes(b'fixture-executable')
+            maps=game.parent/'res'/'map'/'Skirmish';maps.mkdir(parents=True)
+            (maps/'fixture.kfm').write_bytes(b'fixture-map-data')
+            store=Store(root/'library');inbox=store.root/'CaptureInbox';inbox.mkdir()
+            source=inbox/'123_1.partial.complete.rejected'
+            raw=bytearray(network_fixture())
+            struct.pack_into('<I',raw,8+8+INITIAL_SIZE+8+48*4,1952796276)
+            source.write_bytes(raw)
+            source.with_suffix(source.suffix+'.json').write_text(json.dumps({'error':'손상된 멀티 참가자 설정'}),encoding='utf-8')
+            with patch('engine.GAME_HASH',hashlib.sha256(game.read_bytes()).hexdigest()):
+                done,errors=collect_completed(game,store)
+                self.assertEqual((len(done),errors),(1,[]))
+                with zipfile.ZipFile(done[0]) as z: self.assertEqual(z.read('commands.bin'),raw)
+                self.assertEqual(collect_completed(game,store),([],[]))
+
+    def test_network_capture_parser(self):
+        trace=parse_trace(fixture(network_mode=1))
+        self.assertEqual(trace.network_mode,1)
+        self.assertEqual(trace.commands,1)
+        self.assertEqual(trace.frames[0][1][0],(1,0,0,b'\x05\x00\x00\x00'))
+        with self.assertRaisesRegex(ValueError,'네트워크'):
+            parse_trace(fixture(network_mode=2))
+
+    def test_network_capture_package_blocks_unimplemented_playback(self):
+        with tempfile.TemporaryDirectory() as root:
+            root=Path(root);game=root/'game'/'KingdomUnderFire.exe'
+            game.parent.mkdir();game.write_bytes(b'fixture-executable')
+            maps=game.parent/'res'/'map'/'Skirmish';maps.mkdir(parents=True)
+            (maps/'fixture.kfm').write_bytes(b'fixture-map-data')
+            source=root/'capture.partial.complete';source.write_bytes(fixture(network_mode=1))
+            store=Store(root/'library')
+            with patch('engine.GAME_HASH',hashlib.sha256(game.read_bytes()).hexdigest()):
+                replay=package_capture(source,game,store)
+                metadata=validate(replay)
+                self.assertEqual(metadata['recording_mode'],'multiplayer')
+                self.assertEqual(metadata['network_mode'],1)
+                self.assertFalse(metadata['playback_supported'])
+                self.assertEqual(metadata['initial_restore'],'multiplayer-lobby-restore-required')
+                self.assertEqual(len(store.listing()),1)
+                self.assertFalse(source.exists())
+                with self.assertRaisesRegex(ValueError,'초기화 설정'):
+                    stage_playback(replay,game,store)
+                self.assertFalse((store.root/'Playback').exists())
+
+    def test_replay_time_including_legacy_metadata(self):
+        metadata={'adapter_id':ADAPTER,'game_sha256':GAME_HASH,'ticks':4621,
+                  'tick_rate':25,'duration_verified':False}
+        self.assertEqual(replay_time(metadata),'2:18')
+        metadata['ticks']=1849
+        self.assertEqual(replay_time(metadata),'0:55')
+        metadata['ticks']=120000
+        self.assertEqual(replay_time(metadata),'60:00')
+        self.assertEqual(replay_time({'ticks':120,'tick_rate':30}),'0:04')
+
     def test_automatic_setup_versions_and_bounds(self):
         raw=fixture();start=8+8+INITIAL_SIZE
         old=struct.pack('<21I',1,0,1,0,0,*([0,0]+[1]*6),*([0,1]+[0]*6))
@@ -94,7 +217,8 @@ class EngineTests(unittest.TestCase):
                 self.assertFalse(source.exists())
                 metadata=validate(replay)
                 self.assertEqual(metadata['adapter_id'],ADAPTER)
-                self.assertFalse(metadata['duration_verified'])
+                self.assertTrue(metadata['duration_verified'])
+                self.assertEqual(metadata['tick_interval_ms'],30)
                 staged,trace=stage_playback(replay,game,store)
                 self.assertEqual(staged.read_bytes(),fixture())
                 self.assertEqual(trace.commands,1)

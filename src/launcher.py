@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from replay_store import Store
 from updater import VERSION, download_latest
-from engine import ADAPTER, launch_engine, collect_completed
+from engine import ADAPTER, launch_engine, collect_completed, process_alive, replay_time
 
 DEFAULT_GAME = Path(r'C:\Program Files (x86)\Steam\steamapps\common\Kingdom Under Fire War of Heroes\KingdomUnderFire.exe')
 
@@ -18,6 +18,8 @@ class Launcher:
         self.store = Store()
         self.events = queue.Queue()
         self.busy = False
+        self.pending = []
+        self.work_key = None
         self.rows = {}
         root.title(f'KUF 리플레이 런처 {VERSION}')
         root.geometry('980x620')
@@ -25,13 +27,13 @@ class Launcher:
         outer = ttk.Frame(root, padding=18)
         outer.pack(fill='both', expand=True)
         ttk.Label(outer, text='KINGDOM UNDER FIRE · REPLAY', font=('Segoe UI', 18, 'bold')).pack(anchor='w')
-        ttk.Label(outer, text='싱글플레이 자동 재생 · 관전자 시야(실험용) · 멀티플레이 미지원', foreground='#b45309').pack(anchor='w', pady=(6, 14))
+        ttk.Label(outer, text='싱글·멀티 자동 기록 · 관전자 자동 재생(실험용) · 멀티 실전 검증 중', foreground='#b45309').pack(anchor='w', pady=(6, 14))
         game = ttk.Frame(outer)
         game.pack(fill='x')
         self.game_path = tk.StringVar(value=self.store.config.get('game_path', str(DEFAULT_GAME)))
         ttk.Entry(game, textvariable=self.game_path).pack(side='left', fill='x', expand=True)
         ttk.Button(game, text='게임 경로', command=self.pick_game).pack(side='left', padx=5)
-        ttk.Label(outer, text='Steam 실행 + 싱글플레이 자동 기록 · 실행 중인 게임은 먼저 닫으세요 · 계정 안내창은 ‘아니요’').pack(anchor='w', pady=(8,0))
+        ttk.Label(outer, text='Steam 실행 + 싱글·멀티 자동 기록 · 실행 중인 게임은 먼저 닫으세요 · 계정 안내창은 ‘아니요’').pack(anchor='w', pady=(8,0))
         controls = ttk.Frame(outer)
         controls.pack(fill='x', pady=14)
         for title, fn in [('폴더 열기', self.open_folder), ('리플레이 가져오기', self.import_replay), ('기존 폴더 이전', self.migrate), ('새로고침', self.refresh), ('런처 업데이트', self.update)]:
@@ -67,7 +69,15 @@ class Launcher:
         root.after(2000, self.collect)
 
     def collect(self):
-        if not self.busy and any((self.store.root/'CaptureInbox').glob('*.partial*')):
+        inbox = self.store.root/'CaptureInbox'
+        needs_collection = any(inbox.glob('*.partial.complete'))
+        if not needs_collection and not self.busy:
+            for capture in inbox.glob('*.partial'):
+                pid = capture.name.split('_', 1)[0]
+                if pid.isdecimal() and not process_alive(int(pid)):
+                    needs_collection = True
+                    break
+        if not self.busy and not self.pending and needs_collection:
             game_path = self.game_path.get()
             def run():
                 completed, errors=collect_completed(game_path,self.store)
@@ -76,14 +86,20 @@ class Launcher:
                 items, completed, errors=result
                 self.render(items)
                 self.status.set(f'{len(completed)}개 자동 저장' if not errors else '기록 검증 실패: '+ '; '.join(errors))
-            self.work(run,done)
+            self.work(run,done,key='collect',background=True)
         self.root.after(2000,self.collect)
 
-    def work(self, fn, done):
+    def work(self, fn, done, key=None, background=False):
         if self.busy:
-            messagebox.showinfo('작업 중', '현재 작업이 끝난 뒤 다시 시도하세요.')
+            if background:
+                return
+            if key and (key == self.work_key or any(job[2] == key for job in self.pending)):
+                return
+            self.pending.append((fn, done, key))
+            self.status.set('요청을 대기열에 넣었습니다. 현재 작업이 끝나면 자동으로 처리합니다.')
             return
         self.busy = True
+        self.work_key = key
         self.status.set('작업 중… 검증 / 디스크 작업을 별도 스레드에서 처리합니다.')
         def worker():
             try:
@@ -96,30 +112,39 @@ class Launcher:
         try:
             done, result, error = self.events.get_nowait()
             self.busy = False
+            self.work_key = None
             self.status.set(f'저장 폴더: {self.store.replays}')
             if error:
                 messagebox.showerror('작업 실패', str(error))
             else:
                 done(result)
+            if self.pending:
+                fn, callback, key = self.pending.pop(0)
+                self.work(fn, callback, key=key)
         except queue.Empty:
             pass
         self.root.after(100, self.poll)
 
     def render(self, items):
+        chosen = self.tree.selection()
+        selected_path = self.rows.get(chosen[0], (None,))[0] if chosen else None
         self.tree.delete(*self.tree.get_children())
         self.rows = {}
         for p, m, pin in items:
-            duration = m['ticks'] // m['tick_rate']
-            time_text=f'{duration//60}:{duration%60:02d}' if m.get('duration_verified',True) else f"{m['ticks']}틱"
+            time_text = replay_time(m)
             compat='싱글 자동 재생 · 실험용' if m['adapter_id']==ADAPTER else '호환 어댑터 없음'
+            if m['adapter_id']==ADAPTER and m.get('recording_mode')=='multiplayer':
+                compat='멀티 자동 재생 · 실험용' if m.get('multiplayer_supported') else '멀티 기록 · 초기화 데이터 없음'
             if m.get('recovery'): compat='종료 누락 복구 · 마지막 배치 제외 · '+compat
             date_text=datetime.fromisoformat(m['recorded_at']).astimezone().strftime('%Y-%m-%d %H:%M:%S')
             row = self.tree.insert('', 'end', values=(date_text, m['map_id'], time_text, '★' if pin else '', compat))
             self.rows[row] = (p, m, pin)
+            if p == selected_path:
+                self.tree.selection_set(row)
         self.status.set(f'{len(items)}개 · {self.store.replays}')
 
     def refresh(self):
-        self.work(self.store.listing, self.render)
+        self.work(self.store.listing, self.render, key='refresh')
 
     def selected(self):
         chosen = self.tree.selection()
@@ -137,7 +162,7 @@ class Launcher:
                 return launch_engine(game,self.store,mode='steam-play',replay=p)
             def done(pid):
                 self.status.set(f"자동 경기 로딩 · PID {pid} · {m['map_id']} · 메뉴/지도 선택 없이 시작합니다.")
-            self.work(run,done)
+            self.work(run,done,key='launch')
 
     def toggle_pin(self):
         item = self.selected()
@@ -168,28 +193,23 @@ class Launcher:
             self.work(run, self.render)
 
     def save_settings(self):
-        if self.busy:
-            messagebox.showinfo('작업 중', '현재 작업이 끝난 뒤 설정을 저장하세요.')
-            return
-        try:
-            self.store.set_keep(self.keep.get())
+        keep = self.keep.get()
+        def done(_):
             messagebox.showinfo('저장 완료', '보관 개수를 저장했습니다. 정리는 다음 기록/가져오기 때 적용됩니다.')
-        except Exception as e:
-            messagebox.showerror('설정 오류', str(e))
+        self.work(lambda:self.store.set_keep(keep), done, key='settings')
 
     def pick_game(self):
-        if self.busy:
-            messagebox.showinfo('작업 중', '현재 작업이 끝난 뒤 경로를 변경하세요.')
-            return
         path = filedialog.askopenfilename(filetypes=[('게임 실행 파일', '*.exe')])
         if path:
             self.game_path.set(path)
-            self.store.config['game_path'] = path
-            self.store.save()
+            def save():
+                self.store.config['game_path'] = path
+                self.store.save()
+            self.work(save, lambda _:None, key='game-path')
 
     def start_game(self):
         path=Path(self.game_path.get())
-        self.work(lambda:launch_engine(path,self.store,mode='steam-record'), lambda pid:self.status.set(f'Steam 게임 기록 엔진 연결 완료 · PID {pid} · 싱글플레이 경기를 끝내고 메뉴로 돌아오면 자동 저장'))
+        self.work(lambda:launch_engine(path,self.store,mode='steam-record'), lambda pid:self.status.set(f'Steam 기록 엔진 연결 완료 · PID {pid} · 싱글·멀티 경기 종료 시 자동 저장'), key='launch')
 
     def update(self):
         def run():

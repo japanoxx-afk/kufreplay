@@ -68,6 +68,8 @@ def validate(path):
             raise ValueError('틱 정보 오류')
         if type(m.get('tick_rate')) is not int or not 1 <= m['tick_rate'] <= 1000:
             raise ValueError('틱 주기 오류')
+        if 'tick_interval_ms' in m and (type(m['tick_interval_ms']) is not int or not 1<=m['tick_interval_ms']<=1000):
+            raise ValueError('시뮬레이션 시간 간격 오류')
         if set(m.get('hashes', {})) != REQUIRED:
             raise ValueError('데이터 무결성 정보 누락')
         for name in REQUIRED:
