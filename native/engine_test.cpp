@@ -67,6 +67,20 @@ bool mapExceptionRestored(void* self) {
     return failed.load() && notice.load()==13 && at<unsigned char>(0xb83ad0)==0;
 }
 uint32_t __fastcall fakeResultRender(void*,void*) {return 123;}
+uint32_t __fastcall fakeFullSurface(void*,void*) {return 456;}
+uint32_t __fastcall fakeVoiceVolume(void*,void*,uint32_t,uint32_t volume,uint32_t) {return volume;}
+uint32_t deathSound=0,deathVolume=0,unitAudioCalls=0,originCalls=0,regionCalls=0;
+uint32_t __fastcall fakeUnitAudio(void*,void*,void*,int,uint32_t) {++unitAudioCalls;return 99;}
+uint32_t __fastcall fakeDeathAudio(void*,void*,uint32_t sound,uint32_t volume,int,int,uint32_t) {
+    deathSound=sound;deathVolume=volume;return 123;
+}
+void __fastcall fakeCameraOrigin(void* self,void*,int x,int y) {
+    ++originCalls;((int*)self)[0]=x;((int*)self)[1]=y;
+}
+void __fastcall fakeCameraRegion(void* self,void*,int x,int y,int width,int height) {
+    if(width!=-1 || height!=-1) exit(2);
+    ++regionCalls;((int*)self)[0]=x;((int*)self)[1]=y;
+}
 bool processThrows=false;
 uint32_t __fastcall fakeNetworkProcess(void*,void*) {
     auto queue=at<void*>(0xb870c8);auto table=*(void***)queue;
@@ -88,6 +102,7 @@ uint32_t __fastcall fakeObserverDraw(void* self,void*) {
 uint32_t __fastcall fakeObserverThrow(void*,void*) {RaiseException(0xe0000123,0,0,nullptr);return 0;}
 uint32_t __fastcall fakeAudio(void* self,void*,uint32_t a,uint32_t b,int x,int y,uint32_t c) {
     if(at<int>(0xbf2588)!=1066 || observerAudioVisibility(self,nullptr,7,x,y)!=1) {fprintf(stderr,"audio fixture width/depth %d/%u\n",at<int>(0xbf2588),observerAudioDepth);exit(2);}
+    if(at<int>(0xb869c4)!=700 || at<int>(0xb869c8)!=800) {fprintf(stderr,"audio camera cache mismatch\n");exit(2);}
     return a+b+c;
 }
 uint32_t __fastcall fakeAudioThrow(void*,void*,uint32_t,uint32_t,int,int,uint32_t) {RaiseException(0xe0000123,0,0,nullptr);return 0;}
@@ -98,12 +113,14 @@ bool audioExceptionRestored(void* self) {
     return caught && observerAudioDepth==0 && at<int>(0xbf2588)==866;
 }
 bool panelThrows=false;
+bool panelKnownFault=false;
 uint32_t syncedSelection=99;
 uint32_t __fastcall fakePanelSync(void*,void*,uint32_t write) {syncedSelection=write;return 1;}
 uint32_t __fastcall fakePanel(void* self,void*) {
     auto game=(unsigned char*)at<void*>(0xb8282c);
     if(*(uint32_t*)(game+0x664)!=1 || *(int16_t*)((unsigned char*)self+0x1898)!=1 || !observerPanelDrawing) {fprintf(stderr,"panel fixture owner/count/drawing %u/%d/%d\n",*(uint32_t*)(game+0x664),*(int16_t*)((unsigned char*)self+0x1898),observerPanelDrawing);exit(2);}
     observerSelectionSync(self,nullptr,1);
+    if(panelKnownFault) ((void(__cdecl*)())address(0x4943fd))();
     if(panelThrows) RaiseException(0xe0000123,0,0,nullptr);
     return 456;
 }
@@ -154,6 +171,17 @@ int main() {
     require(!bootstrapCounterOnly(different,counterExpected,counterAfter),"never normalize a different simulation tick");
     different=counterAfter;different.randomCount++;
     require(!bootstrapCounterOnly(counterActual,counterExpected,different),"require consistent command and batch counter checkpoint");
+    require(observerTrackingShortcut('C',(SHORT)0x8000,0),"Ctrl+C starts tracking");
+    require(!observerTrackingShortcut('C',0,0),"plain C never starts tracking");
+    require(!observerTrackingShortcut('C',(SHORT)0x8000,1L<<30),"Ctrl+C repeat does not toggle");
+    require(!observerTrackingShortcut('O',(SHORT)0x8000,0),"other Ctrl shortcuts do not track");
+    char shortDisplay[20];
+    require(observerDisplayName("ab",shortDisplay)==2 && !strcmp(shortDisplay,"ab"),"short IDs keep compact display");
+    require(observerDisplayName("abcdefghijklmnopq",shortDisplay)==18 && !strcmp(shortDisplay,"abcdefghijklmnop.."),"long IDs truncate consistently for column sizing");
+    playback=true;
+    require(replayVoice(nullptr,(VoiceAudio)fakeVoiceVolume,500,100,0)==0,"replay unit dialogue is muted");
+    playback=false;
+    require(replayVoice(nullptr,(VoiceAudio)fakeVoiceVolume,500,100,0)==100,"normal gameplay speech volume remains unchanged");
     RECT cursorClipBefore{},cursorClipAfter{};
     GetClipCursor(&cursorClipBefore);
     int cursorCount=ShowCursor(FALSE);
@@ -167,8 +195,82 @@ int main() {
     base=(uintptr_t)VirtualAlloc(nullptr,0x882000,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
     require(base!=0,"fixture memory");
     textBase=base;textSize=0x882000;expectedText.resize(textSize);
+    at<uint32_t>(0xb8a1e0)=120;playback=true;
+    require(replayDeathVolume(0)==120,"replay death event uses effects volume despite muted speech");
+    at<uint32_t>(0xb8a1e0)=0;
+    require(replayDeathVolume(120)==0,"death effects respect user effects mute");
+    playback=false;require(replayDeathVolume(90)==90,"normal gameplay death volume unchanged");
+    {
+        unsigned char dyingUnit[0x80]{},playerAudio[0x600]{};
+        *(int16_t*)(dyingUnit+4)=0;*(int16_t*)(dyingUnit+8)=2;
+        *(int*)(playerAudio+0x590)=3; // Observer differs from dying unit owner.
+        at<int16_t>(0xb38f50+16)=2;at<int16_t>(0xb38f52+16)=2508;
+        at<int16_t>(0xb39a52)=-1;at<int16_t>(0xb39a54)=0;
+        at<void*>(0xb83ab0)=playerAudio;spatialAudio=(Audio)fakeDeathAudio;
+        at<uint32_t>(0xb8a1e0)=120;at<uint32_t>(0xb8a1e4)=0;
+        at<uint32_t>(0xb3e648)=777;at<uint32_t>(0xbed1e8)=888;
+        playback=true;active=true;producer=GetCurrentThreadId();
+        unsigned char savedPlayer[sizeof(playerAudio)];memcpy(savedPlayer,playerAudio,sizeof(playerAudio));
+        require(replayUnitAudio(playerAudio,(UnitAudio)fakeUnitAudio,dyingUnit,4,0)==123,"observer hears remote owner's death without native ownership or speech gate");
+        require(deathSound==2509 && deathVolume==120 && unitAudioCalls==0,"available death variant uses effects volume and skips unavailable variant");
+        require(!memcmp(savedPlayer,playerAudio,sizeof(playerAudio)) && at<uint32_t>(0xb3e648)==777 && at<uint32_t>(0xbed1e8)==888,"death playback preserves player caches and both RNG states");
+        require(replayUnitAudio(playerAudio,(UnitAudio)fakeUnitAudio,dyingUnit,1,0)==99,"non-death response retains native handling");
+        playback=false;
+        require(replayUnitAudio(playerAudio,(UnitAudio)fakeUnitAudio,dyingUnit,4,0)==99,"normal game death handling remains native");
+        active=false;producer=0;at<void*>(0xb83ab0)=nullptr;spatialAudio=nullptr;
+    }
+    {
+        const unsigned char safeFileQuery[]={0x8b,0x49,0x04,0x85,0xc9,0x75,0x03,0x32,0xc0,0xc3,0x8b,0x01,0x8b,0x40,0x1c,0xff,0xe0};
+        memcpy(address(0x5f7710),safeFileQuery,sizeof(safeFileQuery));
+        unsigned char fileObject[8]{};using FileQuery=unsigned char(__thiscall*)(void*);
+        require(((FileQuery)address(0x5f7710))(fileObject)==0,"native safe file query handles reported null backend");
+        void* methods[8]{};methods[7]=(void*)fakeFullSurface;void** backend=methods;
+        *(void**)(fileObject+4)=&backend;
+        require(((FileQuery)address(0x5f7710))(fileObject)==(unsigned char)456,"native safe file query preserves live backend dispatch");
+    }
     ring=(unsigned char*)VirtualAlloc(nullptr,RingSize,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
     require(ring!=nullptr,"ring memory");
+    {
+        unsigned char trackManager[0x2c3c]{},trackGame[0xa00]{},trackUnit[0x80]{},replacementUnit[0x80]{};
+        at<void*>(0xb870c0)=trackManager;*(unsigned char**)(trackManager+0x2c38)=trackUnit;
+        *(uint16_t*)(trackUnit+0x14)=100;*(int16_t*)(trackUnit+8)=2;
+        *(int*)(trackUnit+0x18)=1500;*(int*)(trackUnit+0x1c)=1400;
+        *(int*)(trackGame+0x38)=128;*(int*)(trackGame+0x3c)=128;
+        at<int>(0xbf2588)=800;at<int>(0xbf258c)=600;
+        playback=true;active=true;observerSelected=0;
+        unsigned char beforeUnit[sizeof(trackUnit)];memcpy(beforeUnit,trackUnit,sizeof(trackUnit));
+        at<int>(0xb869c4)=900;at<int>(0xb869c8)=700;
+        toggleObserverTracking();updateObserverTracking(trackGame);
+        require(observerTracked==0 && at<int>(0xb869c4)==1100 && at<int>(0xb869c8)==1100,"tracking centers selected unit regardless of previous screen position");
+        unsigned char renderer[0x3c]{};int terrainOrigin[2]{};int* originPointer=terrainOrigin;
+        *(void**)(renderer+0x38)=&originPointer;at<void*>(0xb86f14)=renderer;
+        for(auto target:{std::pair<uint32_t,void*>(0x67c5c0,(void*)fakeCameraOrigin),{0x630930,(void*)fakeCameraRegion}}) {
+            auto stub=(unsigned char*)address(target.first);stub[0]=0xe9;
+            int32_t relative=(int32_t)((uintptr_t)target.second-(uintptr_t)stub-5);memcpy(stub+1,&relative,4);
+        }
+        *(int*)(trackGame+0x9c4)=900;*(int*)(trackGame+0x9c8)=700;
+        synchronizeObserverCamera(trackGame);
+        require(terrainOrigin[0]==1100 && terrainOrigin[1]==1100 && originCalls==1 && regionCalls==2,"tracking updates terrain and both overlay origins immediately without scrolling");
+        require(*(int*)(trackGame+0x9c4)==1100 && *(int*)(trackGame+0x9c8)==1100 && at<int>(0xbea648)==1100 && at<int>(0xbea698)==1100,"tracking display cache matches centered camera");
+        require(!memcmp(beforeUnit,trackUnit,sizeof(trackUnit)),"camera tracking preserves unit state");
+        *(int*)(trackUnit+0x18)=1800;updateObserverTracking(trackGame);
+        require(at<int>(0xb869c4)==1400 && at<int>(0xb869c8)==1100,"tracking keeps moving target centered");
+        showObserverHud=false;at<int>(0xbf2578)=1000;at<int>(0xbf2580)=0;
+        updateObserverTracking(trackGame);
+        require(at<int>(0xb869c4)==1300,"tracking centers against expanded hidden-HUD viewport");
+        showObserverHud=true;
+        toggleObserverTracking();require(observerTracked==-1,"tracking toggles off");
+        toggleObserverTracking();*(uint16_t*)(trackUnit+0x14)=0;updateObserverTracking(trackGame);
+        require(observerTracked==-1,"tracking stops for dead unit");
+        *(uint16_t*)(trackUnit+0x14)=100;toggleObserverTracking();
+        *(unsigned char**)(trackManager+0x2c38)=replacementUnit;updateObserverTracking(trackGame);
+        require(observerTracked==-1,"tracking stops when target slot changes object");
+        *(unsigned char**)(trackManager+0x2c38)=trackUnit;
+        *(void**)trackUnit=address(0xa2b7dc);
+        require(observerUnit(0)==nullptr,"fog proxy is never treated as full gameplay unit");
+        toggleObserverTracking();require(observerTracked==-1,"fog proxy cannot enter observer tracking");
+        playback=false;active=false;observerSelected=-1;at<void*>(0xb870c0)=nullptr;at<void*>(0xb86f14)=nullptr;
+    }
     // The checksum call target is a five-byte tail jump to a fixture function with the same ECX ABI.
     auto code=(unsigned char*)address(0x4dae50);code[0]=0xe9;
     int32_t delta=(int32_t)((uintptr_t)fakeChecksum-(uintptr_t)code-5);memcpy(code+1,&delta,4);
@@ -205,9 +307,17 @@ int main() {
     enterObserverDisplay();require(at<int>(0xbf2588)==1066 && *(int*)(context+0x974)==1066,"HUD hidden extends sprite clipping to the complete viewport");leaveObserverDisplay();
     require(at<int>(0xbf2588)==866 && *(int*)(context+0x974)==866,"viewport and sprite clips restored after ordinary rendering");
     require(observerExceptionRestored(self) && at<int>(0xbf2588)==866 && *(int*)(context+0x974)==866,"viewport and sprite clips restored after rendering exception");
+    at<int>(0xb869c4)=1300;at<int>(0xb869c8)=1400;
+    *(int*)(self+0x9c4)=700;*(int*)(self+0x9c8)=800;
     require(observerAudio(self,(Audio)fakeAudio,1,2,1000,100,5)==8 && observerAudioDepth==0 && at<int>(0xbf2588)==866,"spatial audio uses full hidden-HUD viewport with scoped visibility");
-    require(audioExceptionRestored(self),"audio exception restores width and visibility scope");
-    showObserverHud=true;
+    require(at<int>(0xb869c4)==1300 && at<int>(0xb869c8)==1400,"audio restores simulation camera after playback");
+    require(audioExceptionRestored(self) && at<int>(0xb869c4)==1300 && at<int>(0xb869c8)==1400,"audio exception restores camera, width and visibility scope");
+    showObserverHud=true;observerHudRedrawFrames=0;
+    toggleObserverHud();require(!showObserverHud && !observerHudRedrawFrames,"hide HUD cancels pending full redraw");
+    toggleObserverHud();require(showObserverHud && observerHudRedrawFrames==3,"show HUD schedules display buffer restoration");
+    require(redrawObserverSurface(self,(Process)fakeResultRender,(Process)fakeFullSurface)==456,"HUD restore draws all retained sprites instead of dirty list");
+    observerHudRedrawFrames=0;
+    require(redrawObserverSurface(self,(Process)fakeResultRender,(Process)fakeFullSurface)==123,"normal HUD frames retain incremental rendering");
     auto ui=(unsigned char*)address(0x620000);memset(ui,0,0x1908);
     auto uiMethods=(void**)address(0x630000);memset(uiMethods,0,512);uiMethods[4]=(void*)fakePanel;
     *(void**)ui=uiMethods;*(void**)(ui+0x23c)=address(0x610000);*(int16_t*)(ui+0x1898)=42;
@@ -218,6 +328,12 @@ int main() {
     auto syncCode=(unsigned char*)address(0x512a00);syncCode[0]=0xe9;
     delta=(int32_t)((uintptr_t)fakePanelSync-(uintptr_t)syncCode-5);memcpy(syncCode+1,&delta,4);
     require(observerPanelHook(ui,nullptr)==456 && syncedSelection==0,"observer panel reads selected owner without writing player selection");
+    auto nullStreamRead=(unsigned char*)address(0x4943fd);
+    const unsigned char faultCode[]={0xa1,8,0,0,0,0xc3};memcpy(nullStreamRead,faultCode,sizeof(faultCode));
+    panelKnownFault=true;
+    require(observerPanelHook(ui,nullptr)==0 && observerPanelUnavailable && !observerPanelDrawing && *(uint32_t*)(self+0x664)==0,"reported null-stream fault contained with owner restored");
+    require(observerPanelHook(ui,nullptr)==0,"failed information panel is not called repeatedly");
+    panelKnownFault=false;observerPanelUnavailable=false;
     require(*(uint32_t*)(self+0x664)==0 && *(int16_t*)(ui+0x1898)==42 && *(void**)ui==uiMethods,"observer panel preserves native player and original UI selection");
     require(panelExceptionRestored(ui),"observer panel restores local player on exception");
     originalSelection=(Selection)fakeSelection;

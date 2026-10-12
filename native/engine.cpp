@@ -65,8 +65,11 @@ Process prepareDisplay=nullptr,drawDisplay=nullptr;
 Process interfaceRender=nullptr;
 using Audio=uint32_t(__thiscall*)(void*,uint32_t,uint32_t,int,int,uint32_t);
 Audio spatialAudio=nullptr,spatialLoopAudio=nullptr;
+using UnitAudio=uint32_t(__thiscall*)(void*,void*,int,uint32_t);
+UnitAudio localUnitAudio=nullptr,remoteUnitAudio=nullptr;
+std::atomic<uint32_t> observerDeathEvents{0},observerDeathSubmitted{0};
 unsigned observerAudioDepth=0;
-std::atomic<uint32_t> observerAudioCalls{0};
+std::atomic<uint32_t> observerAudioCalls{0},observerAudioOnscreen{0},observerAudioRejected{0},observerAudioDisabled{0},observerAudioCameraFixes{0},observerAudioTick{0};
 using Selection=uint32_t(__thiscall*)(void*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
 Selection originalSelection=nullptr;
 uint32_t __fastcall selectionHook(void* self,void*,uint32_t a,uint32_t b,uint32_t c,uint32_t d,uint32_t e,uint32_t f,uint32_t g,uint32_t h) {
@@ -82,7 +85,16 @@ int savedViewportWidth=0;
 struct ClipBackup {unsigned char* object;int width;};
 ClipBackup clipBackups[2]{};
 unsigned clipCount=0;
-bool showResources=true,showObserverHud=true;
+bool showResources=true,showObserverHud=true,showReplayTime=true;
+unsigned observerHudRedrawFrames=0;
+void toggleObserverHud() {
+    showObserverHud=!showObserverHud;
+    // Refresh all retained sprite surfaces across the display buffer cycle.
+    observerHudRedrawFrames=showObserverHud?3:0;
+}
+uint32_t redrawObserverSurface(void* self,Process original,Process fullDraw) {
+    return playback && active && showObserverHud && observerHudRedrawFrames?fullDraw(self):original(self);
+}
 unsigned replaySpeed=1;
 uint32_t clockWall=0,clockValue=0,clockTarget=0;
 State savedEnd{};
@@ -92,20 +104,95 @@ void* observerPanelSource=nullptr;
 int panelSelected=-2;
 int16_t observerSelectionSlots[16]{};
 bool observerPanelDrawing=false;
+bool observerPanelUnavailable=false;
 unsigned char* observerTerrainPixels=nullptr;
 unsigned char* observerTerrainRows=nullptr;
 size_t observerTerrainCapacity=0,observerRowCapacity=0;
 unsigned char* observerUnit(int index);
+void synchronizeObserverCamera(void* self);
+void log(const char* text);
+int observerPanelException(EXCEPTION_POINTERS* info) {
+    const auto exception=info->ExceptionRecord;
+    // Only the reported panel null-stream read; simulation and other failures
+    // keep their normal exception handling. Never bypass replay state checks.
+    if(exception->ExceptionCode!=EXCEPTION_ACCESS_VIOLATION || exception->ExceptionAddress!=address(0x4943fd) ||
+       exception->NumberParameters<2 || exception->ExceptionInformation[0]!=0 || exception->ExceptionInformation[1]!=8) return EXCEPTION_CONTINUE_SEARCH;
+    observerPanelUnavailable=true;
+    log("RP01: Native observer information panel null-stream read prevented; basic observer information remains available.");
+    return EXCEPTION_EXECUTE_HANDLER;
+}
 
 uint32_t observerAudio(void* self,Audio original,uint32_t a,uint32_t b,int x,int y,uint32_t c) {
     if(!playback || !active || GetCurrentThreadId()!=producer) return original(self,a,b,x,y,c);
-    int savedWidth=at<int>(0xbf2588);uint32_t result=0;
+    int savedWidth=at<int>(0xbf2588),savedX=at<int>(0xb869c4),savedY=at<int>(0xb869c8);uint32_t result=0;
     __try {
         ++observerAudioDepth;++observerAudioCalls;
         if(!showObserverHud) at<int>(0xbf2588)=at<int>(0xbf2578)-at<int>(0xbf2580);
+        // Rendering and picking use CGame's camera cache (4c6acf/4ced63).
+        // Use that same visible origin for distance and pan, then restore it.
+        auto game=(unsigned char*)at<void*>(0xb8282c);
+        if(game) {
+            int visibleX=*(int*)(game+0x9c4),visibleY=*(int*)(game+0x9c8);
+            if(visibleX>=128 && visibleY>=128) {
+                if(visibleX!=savedX || visibleY!=savedY) ++observerAudioCameraFixes;
+                at<int>(0xb869c4)=visibleX;at<int>(0xb869c8)=visibleY;
+            }
+        }
+        if(x>=at<int>(0xb869c4) && (int64_t)x< (int64_t)at<int>(0xb869c4)+at<int>(0xbf2588) &&
+           y>=at<int>(0xb869c8) && (int64_t)y< (int64_t)at<int>(0xb869c8)+at<int>(0xbf258c)) ++observerAudioOnscreen;
+        if(!at<int>(0xbf2660) || (at<unsigned char>(0xbea2af) && !at<unsigned char>(0xbea2ae))) ++observerAudioDisabled;
         result=original(self,a,b,x,y,c);
-    } __finally {--observerAudioDepth;at<int>(0xbf2588)=savedWidth;}
+        if(result==0xffffffffu) ++observerAudioRejected;
+    } __finally {
+        --observerAudioDepth;at<int>(0xbf2588)=savedWidth;
+        at<int>(0xb869c4)=savedX;at<int>(0xb869c8)=savedY;
+    }
     return result;
+}
+using VoiceAudio=uint32_t(__thiscall*)(void*,uint32_t,uint32_t,uint32_t);
+uint32_t replayVoice(void* self,VoiceAudio original,uint32_t sound,uint32_t volume,uint32_t flags) {
+    // Verified voice-volume call sites only; never classify by numeric volume equality.
+    return original(self,sound,playback?0:volume,flags);
+}
+uint32_t __fastcall replayVoiceHook(void* self,void*,uint32_t sound,uint32_t volume,uint32_t flags) {
+    return replayVoice(self,(VoiceAudio)address(0x541a40),sound,volume,flags);
+}
+uint32_t replayDeathVolume(uint32_t volume) {return playback?at<uint32_t>(0xb8a1e0):volume;}
+uint32_t __fastcall replaySpatialVoiceHook(void* self,void*,uint32_t sound,uint32_t volume,int x,int y,uint32_t flags) {
+    // Death events are handled before ownership/cooldown gates below. Remaining
+    // spatial responses (e.g. forced acknowledgements) are dialogue, too.
+    return observerAudio(self,spatialAudio,sound,playback?0:volume,x,y,flags);
+}
+uint32_t replayUnitAudio(void* self,UnitAudio original,void* object,int event,uint32_t flags) {
+    if(!playback || !active || event!=4 || GetCurrentThreadId()!=producer)
+        return original(self,object,event,flags);
+    // Death animation routines 481a13/481b23 and faction-specific counterparts
+    // dispatch event 4. Native 521090/53d570 reject other owners or an occupied
+    // speech channel before reaching spatial audio; neither gate applies here.
+    if(!object) return 0;
+    auto unit=(unsigned char*)object;
+    int type=*(int16_t*)(unit+4);
+    if(type<0 || type>=116) return 0;
+    uint32_t serial=observerDeathEvents.fetch_add(1);
+    int count=at<int16_t>(0xb38f50+type*20+16);
+    int first=at<int16_t>(0xb38f52+type*20+16);
+    if(count<=0 || count>16 || first<0 || !spatialAudio || !at<void*>(0xb83ab0)) return 0;
+    for(int n=0;n<count;++n) {
+        int variant=(serial+n)%count;
+        // Same availability marker as native 521211/53d6a8. Retry available
+        // variants without touching native RNG, player response caches or units.
+        if(at<int16_t>(0xb39a52+type*44+variant*2)==-1) continue;
+        ++observerDeathSubmitted;
+        return observerAudio(at<void*>(0xb83ab0),spatialAudio,first+variant,
+            at<uint32_t>(0xb8a1e0),*(int*)(unit+0x18),*(int*)(unit+0x1c),0);
+    }
+    return 0;
+}
+uint32_t __fastcall localUnitAudioHook(void* self,void*,void* unit,int event,uint32_t flags) {
+    return replayUnitAudio(self,localUnitAudio,unit,event,flags);
+}
+uint32_t __fastcall remoteUnitAudioHook(void* self,void*,void* unit,int event,uint32_t flags) {
+    return replayUnitAudio(self,remoteUnitAudio,unit,event,flags);
 }
 uint32_t __fastcall spatialAudioHook(void* self,void*,uint32_t a,uint32_t b,int x,int y,uint32_t c) {return observerAudio(self,spatialAudio,a,b,x,y,c);}
 uint32_t __fastcall spatialLoopAudioHook(void* self,void*,uint32_t a,uint32_t b,int x,int y,uint32_t c) {return observerAudio(self,spatialLoopAudio,a,b,x,y,c);}
@@ -167,6 +254,7 @@ void enterObserverDisplay() {
     clipCount=0;
     if(!showObserverHud) at<int>(0xbf2588)=at<int>(0xbf2578)-at<int>(0xbf2580);
     auto game=(unsigned char*)at<void*>(0xb8282c);
+    if(game) synchronizeObserverCamera(game);
     if(game && !showObserverHud) for(unsigned offset:{0x9b4u,0x9b8u}) {
         auto context=*(unsigned char**)(game+offset);
         if(context && *(void**)context==address(0xa2cea8)) {
@@ -212,11 +300,16 @@ uint32_t observerDisplay(void* self,Process original) {
     return result;
 }
 uint32_t __fastcall prepareDisplayHook(void* self,void*) {return observerDisplay(self,prepareDisplay);}
-uint32_t __fastcall drawDisplayHook(void* self,void*) {return observerDisplay(self,drawDisplay);}
+uint32_t __fastcall drawDisplayHook(void* self,void*) {
+    uint32_t result=observerDisplay(self,drawDisplay);
+    if(playback && active && showObserverHud && observerHudRedrawFrames) --observerHudRedrawFrames;
+    return result;
+}
 uint32_t __fastcall observerPanelHook(void* self,void*) {
     if(playback && active && !showObserverHud) return 0;
     auto original=(Process)(*(void***)self)[4];
     if(!playback || !active) return original(self);
+    if(observerPanelUnavailable) return 0;
     auto game=(unsigned char*)at<void*>(0xb8282c);
     auto ui=(unsigned char*)self;
     if(!game || *(void**)(ui+0x23c)!=((void**)(game+0x48))[*(uint32_t*)(game+0x664)]) return original(self);
@@ -245,7 +338,8 @@ uint32_t __fastcall observerPanelHook(void* self,void*) {
     __try {
         observerPanelDrawing=true;
         if(valid) *(uint32_t*)(game+0x664)=(uint32_t)owner;
-        result=original(observerPanel);
+        __try {result=original(observerPanel);}
+        __except(observerPanelException(GetExceptionInformation())) {result=0;}
     } __finally {*(uint32_t*)(game+0x664)=savedPlayer;observerPanelDrawing=false;}
     return result;
 }
@@ -255,6 +349,8 @@ uint32_t __fastcall observerSelectionSync(void* self,void*,uint32_t writePlayerS
 }
 uint32_t __fastcall observerLayerHook(void* self,void*) {
     auto original=(Process)(*(void***)self)[2];
+    if(original==(Process)address(0x624f00) && playback && active && showObserverHud && observerHudRedrawFrames)
+        return redrawObserverSurface(self,original,(Process)address(0x62dda0));
     if(playback && active && showObserverHud && original==(Process)address(0x4b3ff0)) {
         // 4b2fa0 produces the minimap pixels and tests the display fog flag.
         // Regenerate in the existing display scope, without changing exploration data.
@@ -331,7 +427,64 @@ const char* observerName(unsigned player,char (&fallback)[16]) {
 uint32_t observerRefreshAt=0;
 unsigned char* observerUnit(int index) {
     auto manager=(unsigned char*)at<void*>(0xb870c0);
-    return manager && index>=0 && index<11264?((unsigned char**)(manager+0x2c38))[index]:nullptr;
+    auto unit=manager && index>=0 && index<11264?((unsigned char**)(manager+0x2c38))[index]:nullptr;
+    // KUFCHARFOG is a shorter display proxy, not a KUFCHAR_ gameplay object.
+    // Its apparent +208 vtable entry aliases KUFCHAR_::stream reader 4943d0;
+    // invoking it from panel 506e19 interprets UI stack data as a stream.
+    if(unit && *(void**)unit==address(0xa2b7dc)) {
+        static bool reported=false;
+        if(!reported) {reported=true;log("RP02: KUFCHARFOG display proxy excluded from observer selection, information and tracking.");}
+        return nullptr;
+    }
+    return unit;
+}
+int observerTracked=-1;
+unsigned char* observerTrackedObject=nullptr;
+void stopObserverTracking() {observerTracked=-1;observerTrackedObject=nullptr;}
+bool liveObserverUnit(const unsigned char* unit) {
+    return unit && *(const int16_t*)(unit+0x4c)==0 && *(const uint16_t*)(unit+0x14)>0;
+}
+void toggleObserverTracking() {
+    auto unit=observerUnit(observerSelected);
+    if(!liveObserverUnit(unit) || (observerTracked==observerSelected && observerTrackedObject==unit)) {
+        stopObserverTracking();return;
+    }
+    observerTracked=observerSelected;observerTrackedObject=unit;
+
+}
+void updateObserverTracking(void* self) {
+    if(!playback || !active || observerTracked<0) return;
+    auto unit=observerUnit(observerTracked);
+    if(unit!=observerTrackedObject || !liveObserverUnit(unit)) {stopObserverTracking();return;}
+    auto game=(unsigned char*)self;
+    int width=showObserverHud?at<int>(0xbf2588):at<int>(0xbf2578)-at<int>(0xbf2580);
+    int height=at<int>(0xbf258c);
+    int columns=*(int*)(game+0x38),rows=*(int*)(game+0x3c);
+    if(width<=0 || height<=0 || columns<1 || columns>65535 || rows<1 || rows>65535) return;
+    // Native camera bounds: 53e973..53e9db. Only display origins change;
+    // no player selection, orders, RNG or unit coordinates are modified.
+    int maximumX=std::max(128,columns*32-width-130),maximumY=std::max(128,rows*32-height-130);
+    at<int>(0xb869c4)=std::max(128,std::min(maximumX,*(int*)(unit+0x18)-width/2));
+    at<int>(0xb869c8)=std::max(128,std::min(maximumY,*(int*)(unit+0x1c)-height/2));
+}
+void synchronizeObserverCamera(void* self) {
+    if(!playback || !active || observerTracked<0) return;
+    updateObserverTracking(self);
+    if(observerTracked<0) return;
+    auto renderer=(unsigned char*)at<void*>(0xb86f14);
+    if(!renderer) return;
+    auto holder=*(unsigned char***)(renderer+0x38);
+    if(!holder || !*holder) return;
+    int x=at<int>(0xb869c4),y=at<int>(0xb869c8);
+    // Mirror native 4d8e8d..4d8eec, after its input/timer processing and before
+    // drawing. Global camera changes alone leave terrain/overlay origins stale.
+    using Origin=void(__thiscall*)(void*,int,int);
+    using Region=void(__thiscall*)(void*,int,int,int,int);
+    ((Origin)address(0x67c5c0))(*holder,x,y);
+    ((Region)address(0x630930))(address(0xbea648),x,y,-1,-1);
+    ((Region)address(0x630930))(address(0xbea698),x,y,-1,-1);
+    auto game=(unsigned char*)self;
+    *(int*)(game+0x9c4)=x;*(int*)(game+0x9c8)=y;
 }
 void refreshObserver(void* self) {
     if(at<uint32_t>(0xb8a280)-observerRefreshAt<8 && observerRefreshAt) return;
@@ -366,12 +519,32 @@ void observerText(void* self,int x,int y,const char* text) {
     void* font=*(void**)((unsigned char*)self+0x678);
     if(font) ((Text)address(0x549cf0))(font,x,y,text,(int)strlen(text),0,-1);
 }
+unsigned observerDisplayName(const char* name,char* output) {
+    unsigned end=0;
+    while(name[end] && end<16) {
+        unsigned width=IsDBCSLeadByteEx(949,(BYTE)name[end])?2:1;
+        if(end+width>16) break;
+        end+=width;
+    }
+    memcpy(output,name,end);output[end]=0;
+    if(name[end]) {output[end++]='.';output[end++]='.';output[end]=0;}
+    return end;
+}
+int observerIdColumnWidth() {
+    unsigned longest=2;
+    for(unsigned i=0;i<8;++i) if(observerPlayers[i].participant) {
+        char fallback[16],display[20];
+        longest=std::max(longest,observerDisplayName(observerName(i,fallback),display));
+    }
+    // The game bitmap font uses approximately eight pixels per CP949 byte.
+    return (int)longest*8+12;
+}
 uint32_t __fastcall interfaceHook(void* self,void*) {
     uint32_t result=interfaceRender(self);
     if(!active || !playback) return result;
     refreshObserver(self);
     char line[256]{};
-    if(showObserverHud) {
+    if(showObserverHud && showReplayTime) {
         // The renderer's native dimensions are used; no recorded-resolution coordinates.
         uint32_t tick=at<uint32_t>(0xb8a280),interval=at<uint32_t>(0xb3bae8);
         uint32_t elapsed=(uint32_t)((uint64_t)(tick-savedInitial.state.tick)*interval/1000);
@@ -380,22 +553,16 @@ uint32_t __fastcall interfaceHook(void* self,void*) {
         observerText(self,std::max(12,at<int>(0xbf2588)-300),8,line);
     }
     if(showResources) {
-        const int columns[]={0,135,190,240,285,350};
+        const int idWidth=observerIdColumnWidth();
+        const int columns[]={0,idWidth,idWidth+55,idWidth+105,idWidth+150,idWidth+215};
         const char* labels[]={"ID","Gold","Steel","Mana","Pop","Farm"};
-        int x=std::max(12,at<int>(0xbf2588)-410);
+        int x=std::max(12,at<int>(0xbf2588)-(idWidth+275));
         for(unsigned c=0;c<6;++c) observerText(self,x+columns[c],28,labels[c]);
         int y=46;
         for(unsigned i=0;i<8;++i) if(observerPlayers[i].participant) {
             auto& row=observerPlayers[i];
             char fallback[16];const char* name=observerName(i,fallback);
-            unsigned end=0;
-            while(name[end] && end<16) {
-                unsigned width=IsDBCSLeadByteEx(949,(BYTE)name[end])?2:1;
-                if(end+width>16) break;
-                end+=width;
-            }
-            memcpy(line,name,end);line[end]=0;
-            if(name[end]) strcat_s(line,"..");
+            observerDisplayName(name,line);
             observerText(self,x+columns[0],y,line);
             int values[]={row.gold,row.steel,row.mana,row.population,row.farmers};
             for(unsigned c=1;c<6;++c) {
@@ -404,22 +571,6 @@ uint32_t __fastcall interfaceHook(void* self,void*) {
                 observerText(self,x+columns[c],y,line);
             }
             y+=17;
-        }
-    }
-    auto unit=observerUnit(observerSelected);
-    if(showObserverHud && unit && *(int16_t*)(unit+0x4c)==0) {
-        int type=*(int16_t*)(unit+4);
-        const char* known=type==0?"Peasant":type==15?"Gnome Slave":type==46?"Keep":type==62?"Fortress":(*(int16_t*)(unit+6)?"Building":"Unit");
-        char fallback[16];
-        sprintf_s(line,"Observer: %s  %s #%d  HP %u/%u",observerName((unsigned)*(int16_t*)(unit+8),fallback),
-            known,type,*(uint16_t*)(unit+0x14),*(uint16_t*)(unit+0x16));
-        observerText(self,12,std::max(140,at<int>(0xbf257c)-64),line);
-        // Native construction progress (478970); do not confuse the sprite stage
-        // at 14a6 with a training/research queue.
-        if(*(int16_t*)(unit+6)==1 && unit[0x1491] && *(uint16_t*)(unit+0x16)) {
-            uint32_t percent=(*(uint32_t*)(unit+0x1498)>>10)*100/ *(uint16_t*)(unit+0x16);
-            sprintf_s(line,"Construction: %u%%",std::min(percent,100u));
-            observerText(self,12,std::max(162,at<int>(0xbf257c)-42),line);
         }
     }
     return result;
@@ -692,17 +843,31 @@ uint32_t __fastcall applicationHook(void* self,void*) {
     return applicationProcess(self);
 }
 
+bool observerTrackingShortcut(WPARAM key, SHORT controlState, LPARAM flags) {
+    return key=='C' && (controlState&0x8000)!=0 && !(flags&(1L<<30));
+}
+
 LRESULT CALLBACK recordingWindowProc(HWND window,UINT message,WPARAM wparam,LPARAM lparam) {
+    if(playback && active && wparam=='C' && (message==WM_KEYDOWN || message==WM_KEYUP)) {
+        if(message==WM_KEYDOWN && observerTrackingShortcut(wparam,GetKeyState(VK_CONTROL),lparam)) toggleObserverTracking();
+        return 0;
+    }
+    if(playback && (wparam==3 || wparam=='c' || wparam=='C') && (message==WM_CHAR || message==WM_SYSCHAR)) return 0;
     if(playback && ((wparam=='O' && (message==WM_KEYDOWN || message==WM_KEYUP || message==WM_SYSKEYDOWN || message==WM_SYSKEYUP)) ||
        ((wparam=='o' || wparam=='O') && (message==WM_CHAR || message==WM_SYSCHAR)))) return 0;
     if(playback && active && !terminal.load() && (message==WM_KEYDOWN || message==WM_KEYUP) && wparam==VK_ESCAPE) {
         if(message==WM_KEYDOWN && !(lparam&(1L<<30)) && !exitConfirmationOpen && !playbackExitRequested) confirmPlaybackExit(window);
         return 0;
     }
+    if(playback && active && wparam=='T' && (message==WM_KEYDOWN || message==WM_KEYUP)) {
+        if(message==WM_KEYDOWN && !(lparam&(1L<<30))) showReplayTime=!showReplayTime;
+        return 0;
+    }
+    if(playback && active && (wparam=='t' || wparam=='T') && (message==WM_CHAR || message==WM_SYSCHAR)) return 0;
     if(playback && active && message==WM_KEYUP && (wparam=='I' || wparam=='U' || wparam=='1' || wparam=='2' || wparam=='4')) return 0;
     if(playback && active && message==WM_KEYDOWN && !(lparam&(1L<<30))) {
         if(wparam=='I') {showResources=!showResources;return 0;}
-        if(wparam=='U') {showObserverHud=!showObserverHud;return 0;}
+        if(wparam=='U') {toggleObserverHud();return 0;}
         if(wparam=='1' || wparam=='2' || wparam=='4') {
             playbackClock();replaySpeed=(unsigned)(wparam-'0');return 0;
         }
@@ -947,6 +1112,7 @@ void __cdecl resetHook() {
 }
 
 void restore() {
+    stopObserverTracking();
     AcquireSRWLockExclusive(&codeLock);
     for(auto i=patches.rbegin();i!=patches.rend();++i) {
         DWORD old;
@@ -1013,6 +1179,8 @@ uint32_t __fastcall processHook(void* self,void*) {
         showPlaybackNotice();
         return 1;
     }
+    observerAudioTick.store(at<uint32_t>(0xb8a280),std::memory_order_relaxed);
+    updateObserverTracking(self);
     if(playback && savedInitial.networkMode==1 && !restoredEmptyNetworkInitial &&
        savedInitial.state.seed==0 && savedInitial.state.randomCount==0 && savedInitial.state.checksum==0) {
         void* units=at<void*>(0xb870c0);
@@ -1251,11 +1419,30 @@ DWORD WINAPI worker(void* argument) {
             if(ok) {drawDisplay=reinterpret_cast<Process>(patchEntry(0x4ced30,drawPrefix,sizeof(drawPrefix),(void*)drawDisplayHook));ok=drawDisplay!=nullptr;}
             if(ok) {interfaceRender=(Process)address(0x4d5f00);ok=patchCall(0x4c6b78,0x4d5f00,(void*)interfaceHook);}
             if(ok) ok=patchCall(0x5056d5,0x512a00,(void*)observerSelectionSync);
+            // Report 261013-015445: 5f7703 dereferences a null internal file handle
+            // from audio loader 5400df. Native 5f7710 is the same query with a null check.
+            const unsigned char fileQueryPrefix[]={0x8b,0x49,0x04,0x8b,0x01};
+            if(ok && !memcmp(address(0x5f7700),fileQueryPrefix,sizeof(fileQueryPrefix))) {
+                std::vector<unsigned char> jump(5);jump[0]=0xe9;
+                int32_t delta=(int32_t)((uintptr_t)address(0x5f7710)-(uintptr_t)address(0x5f7700)-5);
+                memcpy(jump.data()+1,&delta,4);ok=change((unsigned char*)address(0x5f7700),jump);
+            } else ok=false;
             const unsigned char audioPrefix[]={0x55,0x8b,0xec,0x83,0xe4,0xf8};
             if(ok) {spatialAudio=(Audio)patchEntry(0x540e70,audioPrefix,sizeof(audioPrefix),(void*)spatialAudioHook);ok=spatialAudio!=nullptr;}
             if(ok) {spatialLoopAudio=(Audio)patchEntry(0x5410a0,audioPrefix,sizeof(audioPrefix),(void*)spatialLoopAudioHook);ok=spatialLoopAudio!=nullptr;}
             if(ok) ok=patchCall(0x540eb0,0x4369f0,(void*)observerAudioVisibility);
             if(ok) ok=patchCall(0x5410e0,0x4369f0,(void*)observerAudioVisibility);
+            // These calls load the speech volume b8a1e4. Effects load b8a1e0.
+            for(uint32_t call:{0x4656eau,0x480f09u,0x48cc48u,0x48cecfu,0x48cf4cu,0x49179bu,
+                0x4ad7a1u,0x4ad7c3u,0x4c1d0fu,0x4c54e3u,0x4f5626u,0x5011deu,0x5213ebu,
+                0x52f377u,0x5d79cau,0x5e0ffcu,0x5e8a05u})
+                if(ok) ok=patchCall(call,0x541a40,(void*)replayVoiceHook);
+            for(uint32_t call:{0x521409u,0x53d87au})
+                if(ok) ok=patchCall(call,0x540e70,(void*)replaySpatialVoiceHook);
+            const unsigned char localAudioPrefix[]={0x55,0x8b,0xec,0x83,0xec,0x48};
+            const unsigned char remoteAudioPrefix[]={0x55,0x8b,0xec,0x83,0xec,0x44};
+            if(ok) {localUnitAudio=(UnitAudio)patchEntry(0x521090,localAudioPrefix,sizeof(localAudioPrefix),(void*)localUnitAudioHook);ok=localUnitAudio!=nullptr;}
+            if(ok) {remoteUnitAudio=(UnitAudio)patchEntry(0x53d570,remoteAudioPrefix,sizeof(remoteAudioPrefix),(void*)remoteUnitAudioHook);ok=remoteUnitAudio!=nullptr;}
             const unsigned char panelCall[]={0x8b,0x01,0xff,0x50,0x10};
             if(ok && !memcmp(address(0x4d6c38),panelCall,sizeof(panelCall))) {
                 std::vector<unsigned char> bytes={0xe8,0,0,0,0};
@@ -1308,6 +1495,14 @@ DWORD WINAPI worker(void* argument) {
         }
         if(gameWindow && !playback && GetTickCount64()-pulseAt>250) {
             pulseAt=GetTickCount64();PostMessageW(gameWindow,RecordPulse,0,0);
+        }
+        if(playback) {
+            static ULONGLONG audioLogAt=0;
+            if(GetTickCount64()-audioLogAt>=10000) {
+                audioLogAt=GetTickCount64();char line[256];
+                sprintf_s(line,"AU01 audio tick=%u calls=%u onscreen=%u rejected=%u disabled=%u camera-aligned=%u death-events=%u death-submitted=%u",observerAudioTick.load(),observerAudioCalls.load(),observerAudioOnscreen.load(),observerAudioRejected.load(),observerAudioDisabled.load(),observerAudioCameraFixes.load(),observerDeathEvents.load(),observerDeathSubmitted.load());
+                log(line);
+            }
         }
         uint32_t t=tail.load(std::memory_order_relaxed),h=head.load(std::memory_order_acquire);
         if(windowDestroyed.load(std::memory_order_acquire) && t==h) {

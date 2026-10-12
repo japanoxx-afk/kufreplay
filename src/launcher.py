@@ -22,6 +22,7 @@ class Launcher:
         self.pending = []
         self.work_key = None
         self.rows = {}
+        self.shortcut_window = None
         root.title(f'KUF 리플레이 런처 {VERSION}')
         root.geometry('980x620')
         root.minsize(840, 560)
@@ -61,6 +62,7 @@ class Launcher:
         actions.pack(fill='x', pady=10)
         ttk.Button(actions, text='선택 리플레이 재생', command=self.play).pack(side='left')
         ttk.Button(actions, text='영구저장 / 해제', command=self.toggle_pin).pack(side='left', padx=8)
+        ttk.Button(actions, text='단축키 매뉴얼', command=self.show_shortcuts).pack(side='left', padx=(0, 8))
         self.game_button = ttk.Button(actions, text='게임 실행 (Steam)', command=self.start_game)
         self.game_button.pack(side='right')
         self.status = tk.StringVar(value=f'저장 폴더: {self.store.replays}')
@@ -68,6 +70,38 @@ class Launcher:
         self.work(self.store.listing, self.render)
         root.after(100, self.poll)
         root.after(2000, self.collect)
+
+    def show_shortcuts(self):
+        if self.shortcut_window is not None and self.shortcut_window.winfo_exists():
+            self.shortcut_window.deiconify()
+            self.shortcut_window.lift()
+            self.shortcut_window.focus_set()
+            return
+        window = tk.Toplevel(self.root)
+        self.shortcut_window = window
+        window.title('리플레이 단축키 매뉴얼')
+        window.transient(self.root)
+        window.resizable(False, False)
+        body = ttk.Frame(window, padding=20)
+        body.pack(fill='both', expand=True)
+        ttk.Label(body, text='리플레이 단축키', font=('Segoe UI', 15, 'bold')).grid(row=0, column=0, columnspan=2, sticky='w', pady=(0, 12))
+        shortcuts = [
+            ('1 / 2 / 4', '재생 속도: 1배속 / 2배속 / 4배속'),
+            ('I', '자원현황판 표시 / 숨기기'),
+            ('U', '오른쪽 HUD 표시 / 숨기기'),
+            ('T', '배속·경과시간·전체시간 표시 / 숨기기'),
+            ('Ctrl + C', '선택한 유닛을 화면 중앙으로 추적 / 추적 해제'),
+            ('Esc', '리플레이 종료 확인: 예 = 종료, 아니요 = 계속 재생'),
+            ('마우스 클릭', '유닛·건물 선택 및 정보 확인'),
+            ('미니맵 클릭', '해당 지도 위치로 카메라 이동'),
+        ]
+        for row, (key, description) in enumerate(shortcuts, start=1):
+            ttk.Label(body, text=key, font=('Segoe UI', 10, 'bold')).grid(row=row, column=0, sticky='w', padx=(0, 22), pady=6)
+            ttk.Label(body, text=description).grid(row=row, column=1, sticky='w', pady=6)
+        ttk.Separator(body).grid(row=9, column=0, columnspan=2, sticky='ew', pady=12)
+        ttk.Label(body, text='게임 창에 포커스를 둔 상태에서 사용하세요.\nCtrl+C는 유닛 선택 후 사용하며, 지도 끝에서는 카메라 이동 범위가 제한됩니다.\nU로 HUD를 숨기면 시간 표시도 숨겨집니다. O키는 리플레이에서 비활성화됩니다.', wraplength=570).grid(row=10, column=0, columnspan=2, sticky='w')
+        ttk.Button(body, text='닫기', command=window.destroy).grid(row=11, column=0, columnspan=2, sticky='e', pady=(16, 0))
+        window.bind('<Escape>', lambda event: window.destroy())
 
     def collect(self):
         inbox = self.store.root/'CaptureInbox'
