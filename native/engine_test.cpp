@@ -134,6 +134,26 @@ void require(bool condition,const char* message) {
 }
 
 int main() {
+    unsigned char nameSelf[0x520]{},nameStorage[80]{};
+    char* nameText=(char*)nameStorage+16;
+    strcpy_s(nameText,64,"TestUser_2");*(int*)(nameText-12)=10;
+    *(char**)(nameSelf+0x500)=nameText;
+    PlayerNames namesFixture{};captureNames(nameSelf,namesFixture);
+    require(!strcmp(namesFixture.names[0],"TestUser_2") && !namesFixture.names[1][0],"capture lobby CString names without pointers");
+    savedNames=namesFixture;char nameFallback[16];
+    require(!strcmp(observerName(0,nameFallback),"TestUser_2") && !strcmp(observerName(1,nameFallback),"P2"),"display captured names and preserve legacy fallback");
+    savedNames={1,{}};
+    State counterActual{20,63084912,18,64821323},counterAfter{20,63084912,24,64821329};
+    CommandHeader counterExpected{20,63084912,24,12};
+    require(bootstrapCounterOnly(counterActual,counterExpected,counterAfter),"allow only bootstrap diagnostic counter difference");
+    State different=counterActual;different.seed++;
+    require(!bootstrapCounterOnly(different,counterExpected,counterAfter),"never normalize a different RNG generator seed");
+    different=counterActual;different.checksum++;
+    require(!bootstrapCounterOnly(different,counterExpected,counterAfter),"never normalize a different gameplay checksum");
+    different=counterActual;different.tick++;
+    require(!bootstrapCounterOnly(different,counterExpected,counterAfter),"never normalize a different simulation tick");
+    different=counterAfter;different.randomCount++;
+    require(!bootstrapCounterOnly(counterActual,counterExpected,different),"require consistent command and batch counter checkpoint");
     RECT cursorClipBefore{},cursorClipAfter{};
     GetClipCursor(&cursorClipBefore);
     int cursorCount=ShowCursor(FALSE);
@@ -258,6 +278,8 @@ int main() {
     Record networkBegin{};readRing(0,&networkBegin,sizeof(networkBegin));
     require(networkBegin.kind==Begin && networkBegin.size==sizeof(Initial),"network capture emits initial state");
     Record networkNext{};readRing(sizeof(Record)+sizeof(Initial),&networkNext,sizeof(networkNext));
+    require(networkNext.kind==Names && networkNext.size==sizeof(PlayerNames),"network capture includes portable player names");
+    readRing(sizeof(Record)+sizeof(Initial)+sizeof(Record)+sizeof(PlayerNames),&networkNext,sizeof(networkNext));
     require(networkNext.kind==Before,"network capture does not emit single-player menu setup");
     uint32_t networkEnd=head.load();
     recordingWindowProc(nullptr,WM_CLOSE,0,0);

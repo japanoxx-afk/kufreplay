@@ -35,6 +35,19 @@ def network_fixture():
     return raw[:start]+record(8,boot)+raw[start:]
 
 class EngineTests(unittest.TestCase):
+    def test_player_names_preserve_simulation_and_legacy_records(self):
+        original=fixture();offset=8+8+INITIAL_SIZE
+        names=['유저아이디','TestUser_2']+['']*6
+        payload=struct.pack('<I',1)+b''.join(s.encode('cp949').ljust(64,b'\0') for s in names)
+        raw=original[:offset]+record(9,payload)+original[offset:]
+        trace=parse_trace(raw)
+        self.assertEqual(trace.player_names,tuple(names))
+        self.assertEqual(trace.frames,parse_trace(original).frames)
+        self.assertIsNone(parse_trace(original).player_names)
+        for invalid in [payload[:4]+b'x'*64+payload[68:],struct.pack('<I',2)+payload[4:],payload[:4]+b'bad\n'.ljust(64,b'\0')+payload[68:]]:
+            with self.assertRaises(ValueError): parse_trace(original[:offset]+record(9,invalid)+original[offset:])
+        with self.assertRaises(ValueError): parse_trace(original[:offset]+record(9,payload)+record(9,payload)+original[offset:])
+
     def test_network_bootstrap_and_validation(self):
         raw=network_fixture();trace=parse_trace(raw)
         self.assertEqual(len(trace.bootstrap),224)
@@ -110,6 +123,29 @@ class EngineTests(unittest.TestCase):
                 self.assertEqual((len(done),errors),(1,[]))
                 with zipfile.ZipFile(done[0]) as z: self.assertEqual(z.read('commands.bin'),raw)
                 self.assertEqual(collect_completed(game,store),([],[]))
+
+    def test_foreign_missing_map_uses_embedded_user_cache(self):
+        with tempfile.TemporaryDirectory() as root:
+            root=Path(root);game=root/'game'/'KingdomUnderFire.exe'
+            game.parent.mkdir();game.write_bytes(b'fixture-executable')
+            maps=game.parent/'res'/'map'/'Skirmish';maps.mkdir(parents=True)
+            map_data=bytearray(108);map_data[:19]=b'KUF Map File v0.67\0'
+            struct.pack_into('<I',map_data,0x2c,2)
+            installed=maps/'fixture.kfm';installed.write_bytes(map_data)
+            source=root/'capture.partial.complete';source.write_bytes(fixture())
+            origin=Store(root/'origin');foreign=Store(root/'foreign')
+            with patch('engine.GAME_HASH',hashlib.sha256(game.read_bytes()).hexdigest()):
+                replay=package_capture(source,game,origin)
+                installed.unlink()
+                staged,trace=stage_playback(replay,game,foreign)
+                self.assertEqual(trace.frames,parse_trace(fixture()).frames)
+                cache=Path(trace.map_directory)/trace.map_name
+                self.assertEqual(cache.read_bytes(),map_data)
+                self.assertTrue(cache.resolve().is_relative_to(foreign.root.resolve()))
+                self.assertFalse(installed.exists())
+                # Do not silently replace a corrupted cache with another map.
+                cache.write_bytes(b'changed')
+                with self.assertRaisesRegex(ValueError,'캐시 무결성'):stage_playback(replay,game,foreign)
 
     def test_network_capture_parser(self):
         trace=parse_trace(fixture(network_mode=1))
@@ -222,10 +258,10 @@ class EngineTests(unittest.TestCase):
                 staged,trace=stage_playback(replay,game,store)
                 self.assertEqual(staged.read_bytes(),fixture())
                 self.assertEqual(trace.commands,1)
-                # A different installation has no local authenticity key.
+                # Portable integrity checks do not require another PC's private key.
                 foreign=Store(root/'foreign')
-                with self.assertRaises(ValueError):
-                    stage_playback(replay,game,foreign)
+                foreign_stage,_=stage_playback(replay,game,foreign)
+                self.assertEqual(foreign_stage.read_bytes(),fixture())
                 # Metadata tampering remains prohibited even with identical byte hashes.
                 with zipfile.ZipFile(replay) as z:
                     contents={name:z.read(name) for name in z.namelist()}

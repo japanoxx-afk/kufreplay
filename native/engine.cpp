@@ -302,6 +302,32 @@ uint32_t __stdcall playbackClock() {
 
 struct ObserverPlayer {bool participant;int steel,gold,mana,population,capacity,farmers;};
 ObserverPlayer observerPlayers[8]{};
+PlayerNames savedNames{1,{}};
+void captureNames(void* self,PlayerNames& names) {
+    names={1,{}};
+    // 58ed30..58ed6d copies lobby names into eight CString fields at +500.
+    // CString stores byte length at data-12; read bounded bytes, no game writes.
+    __try {
+        for(unsigned i=0;i<8;++i) {
+            auto text=*(const char**)((unsigned char*)self+0x500+i*4);
+            if(!text) continue;
+            int length=*(const int*)(text-12);
+            if(length<1 || length>1024) continue;
+            unsigned n=(unsigned)std::min(length,63),end=0;
+            while(end<n) {
+                unsigned width=IsDBCSLeadByteEx(949,(BYTE)text[end])?2:1;
+                if(end+width>n) break;
+                if((BYTE)text[end]<32 || (BYTE)text[end]==127) break;
+                end+=width;
+            }
+            memcpy(names.names[i],text,end);
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {names={1,{}};}
+}
+const char* observerName(unsigned player,char (&fallback)[16]) {
+    if(player<8 && savedNames.names[player][0]) return savedNames.names[player];
+    sprintf_s(fallback,"P%u",player+1);return fallback;
+}
 uint32_t observerRefreshAt=0;
 unsigned char* observerUnit(int index) {
     auto manager=(unsigned char*)at<void*>(0xb870c0);
@@ -354,14 +380,23 @@ uint32_t __fastcall interfaceHook(void* self,void*) {
         observerText(self,std::max(12,at<int>(0xbf2588)-300),8,line);
     }
     if(showResources) {
-        const int columns[]={0,30,85,135,180,240};
-        const char* labels[]={"P","Gold","Steel","Mana","Pop","Farm"};
-        int x=std::max(12,at<int>(0xbf2588)-300);
+        const int columns[]={0,135,190,240,285,350};
+        const char* labels[]={"ID","Gold","Steel","Mana","Pop","Farm"};
+        int x=std::max(12,at<int>(0xbf2588)-410);
         for(unsigned c=0;c<6;++c) observerText(self,x+columns[c],28,labels[c]);
         int y=46;
         for(unsigned i=0;i<8;++i) if(observerPlayers[i].participant) {
             auto& row=observerPlayers[i];
-            sprintf_s(line,"%u",i+1);observerText(self,x+columns[0],y,line);
+            char fallback[16];const char* name=observerName(i,fallback);
+            unsigned end=0;
+            while(name[end] && end<16) {
+                unsigned width=IsDBCSLeadByteEx(949,(BYTE)name[end])?2:1;
+                if(end+width>16) break;
+                end+=width;
+            }
+            memcpy(line,name,end);line[end]=0;
+            if(name[end]) strcat_s(line,"..");
+            observerText(self,x+columns[0],y,line);
             int values[]={row.gold,row.steel,row.mana,row.population,row.farmers};
             for(unsigned c=1;c<6;++c) {
                 if(c==4) sprintf_s(line,"%d/%d",row.population,row.capacity);
@@ -375,7 +410,8 @@ uint32_t __fastcall interfaceHook(void* self,void*) {
     if(showObserverHud && unit && *(int16_t*)(unit+0x4c)==0) {
         int type=*(int16_t*)(unit+4);
         const char* known=type==0?"Peasant":type==15?"Gnome Slave":type==46?"Keep":type==62?"Fortress":(*(int16_t*)(unit+6)?"Building":"Unit");
-        sprintf_s(line,"Observer: P%d  %s #%d  HP %u/%u",*(int16_t*)(unit+8)+1,
+        char fallback[16];
+        sprintf_s(line,"Observer: %s  %s #%d  HP %u/%u",observerName((unsigned)*(int16_t*)(unit+8),fallback),
             known,type,*(uint16_t*)(unit+0x14),*(uint16_t*)(unit+0x16));
         observerText(self,12,std::max(140,at<int>(0xbf257c)-64),line);
         // Native construction progress (478970); do not confuse the sprite stage
@@ -612,7 +648,8 @@ uint32_t __fastcall applicationHook(void* self,void*) {
             memcpy(savedSetup.nativeOptions,savedBootstrap.nativeOptions,16);
             for(unsigned i=0;i<8;++i) {
                 savedSetup.players[i]=i<savedBootstrap.participants?0:1;
-                savedSetup.resources[i]=savedBootstrap.slots[i][1]==2000?1:0;
+                uint32_t race=savedBootstrap.slots[i][1];
+                savedSetup.resources[i]=race==2000?1:race==4000?2:race==3000?3:0;
             }
         } else if(!hasSetup) {
             // Old archives lack menu settings. Infer the bounded default custom setup;
@@ -656,6 +693,8 @@ uint32_t __fastcall applicationHook(void* self,void*) {
 }
 
 LRESULT CALLBACK recordingWindowProc(HWND window,UINT message,WPARAM wparam,LPARAM lparam) {
+    if(playback && ((wparam=='O' && (message==WM_KEYDOWN || message==WM_KEYUP || message==WM_SYSKEYDOWN || message==WM_SYSKEYUP)) ||
+       ((wparam=='o' || wparam=='O') && (message==WM_CHAR || message==WM_SYSCHAR)))) return 0;
     if(playback && active && !terminal.load() && (message==WM_KEYDOWN || message==WM_KEYUP) && wparam==VK_ESCAPE) {
         if(message==WM_KEYDOWN && !(lparam&(1L<<30)) && !exitConfirmationOpen && !playbackExitRequested) confirmPlaybackExit(window);
         return 0;
@@ -699,6 +738,12 @@ BOOL CALLBACK findGameWindow(HWND window,LPARAM) {
     return TRUE;
 }
 
+bool bootstrapCounterOnly(const State& actual,const CommandHeader& expected,const State& after) {
+    return actual.tick==expected.tick && actual.seed==expected.seed && after.tick==actual.tick && after.seed==actual.seed &&
+        after.randomCount==expected.randomCount && actual.randomCount!=expected.randomCount &&
+        actual.checksum-actual.randomCount==after.checksum-after.randomCount;
+}
+
 uint32_t __fastcall commandHook(void* self,void*,uint32_t length,const void* bytes) {
     if(playback && inDispatch) {
         if(failed.load() || replayApply>=replayBatch.size()) {invalidate(8);return 0;}
@@ -706,7 +751,11 @@ uint32_t __fastcall commandHook(void* self,void*,uint32_t length,const void* byt
         const auto& h=command.header;
         if(length!=h.size || memcmp(bytes,command.bytes,length) ||
            h.tick!=at<uint32_t>(0xb8a280) || h.seed!=at<uint32_t>(0xbed1e8) ||
-           h.randomCount!=at<uint32_t>(0xb827dc)) {invalidate(8);return 0;}
+           h.randomCount!=at<uint32_t>(0xb827dc)) {
+            char line[200];sprintf_s(line,"Command mismatch opcode=%u tick=%u/%u seed=%u/%u RNG=%u/%u",*(const uint16_t*)bytes,h.tick,at<uint32_t>(0xb8a280),h.seed,at<uint32_t>(0xbed1e8),h.randomCount,at<uint32_t>(0xb827dc));log(line);
+            State diagnostic{};if(snapshot(self,diagnostic)){char details[100];sprintf_s(details,"Command mismatch actual checksum=%u",diagnostic.checksum);log(details);}
+            invalidate(8);return 0;
+        }
     }
     if(active && inDispatch && !playback && !failed.load()) {
         if(length<2 || length>MaxCommand) invalidate(4);
@@ -717,7 +766,28 @@ uint32_t __fastcall commandHook(void* self,void*,uint32_t length,const void* byt
             emit(Command,buffer,sizeof(h)+length);
         }
     }
-    return apply(self,length,bytes);
+    uint32_t result=apply(self,length,bytes);
+    if(playback && inDispatch && hasBootstrap && frames<=1 && savedInitial.state.randomCount==0 && savedInitial.state.checksum==0 && length==96 && *(const uint16_t*)bytes==1007 && replayApply<replayBatch.size()) {
+        // Native RNG draws use seed, not the diagnostic draw counter. Map setup
+        // resets seed per player. The reported observer trace differs only in
+        // this counter at startup. Normalize only this bootstrap boundary, with equal
+        // generator state and equal native gameplay checksum excluding counter.
+        const auto& expected=replayBatch[replayApply].header;
+        const unsigned char* afterBytes=nullptr;uint32_t afterSize=0;State actual{};
+        bool transportOnly=true;
+        for(size_t i=replayApply;i<replayBatch.size();++i) {
+            uint16_t op=*(const uint16_t*)replayBatch[i].bytes;
+            if(op!=98 && op!=1004 && op!=1005 && op!=1009) transportOnly=false;
+        }
+        if(transportOnly && getRecord(After,afterBytes,afterSize,false) && afterSize==sizeof(State) && snapshot(self,actual)) {
+            const State& after=*(const State*)afterBytes;
+            if(bootstrapCounterOnly(actual,expected,after)) {
+                char line[160];sprintf_s(line,"Bootstrap diagnostic RNG counter normalized %u -> %u; generator seed and gameplay checksum unchanged",actual.randomCount,expected.randomCount);log(line);
+                at<uint32_t>(0xb827dc)=expected.randomCount;
+            }
+        }
+    }
+    return result;
 }
 
 uint32_t __fastcall replayQueueCount(void*,void*) {return static_cast<uint32_t>(replayBatch.size()-replayPop);}
@@ -804,12 +874,14 @@ uint32_t __fastcall advanceHook(void* self,void*,uint32_t a,uint32_t b) {
                 }
                 invalidate(7);return 1;
             }
+            if(nextKind(Names) && (!getRecord(Names,p,n) || n!=sizeof(PlayerNames))) {invalidate(6);return 1;}
             if(nextKind(Setup) && (!getRecord(Setup,p,n) || (n!=84 && n!=sizeof(MatchSetup)))) {invalidate(6);return 1;}
             if(nextKind(Bootstrap) && (!getRecord(Bootstrap,p,n) || n!=sizeof(NetworkBootstrap))) {invalidate(6);return 1;}
         } else {
             MatchSetup setup{};captureSetup(self,setup);
             bootstrapEmitted=false;
             emit(Begin,&initial,sizeof(initial));
+            PlayerNames names{};captureNames(self,names);emit(Names,&names,sizeof(names));
             // Custom-menu globals do not describe the multiplayer lobby.
             if(networkMode==0 && validSetup(setup)) emit(Setup,&setup,sizeof(setup));
             if(networkMode==1 && hasCapturedBootstrap) {emit(Bootstrap,&capturedBootstrap,sizeof(capturedBootstrap));bootstrapEmitted=true;}
@@ -832,7 +904,10 @@ uint32_t __fastcall advanceHook(void* self,void*,uint32_t a,uint32_t b) {
         else {terminal.store(true);notice.store(10);}
         return 1;
     }
-    if(!getRecord(Before,p,n) || n!=sizeof(State) || !same(state,*reinterpret_cast<const State*>(p))) {invalidate(8);return 1;}
+    if(!getRecord(Before,p,n) || n!=sizeof(State)) {invalidate(8);return 1;}
+    if(!same(state,*reinterpret_cast<const State*>(p))) {
+        auto expected=*(const State*)p;char line[240];sprintf_s(line,"Before mismatch tick=%u/%u seed=%u/%u RNG=%u/%u checksum=%u/%u",expected.tick,state.tick,expected.seed,state.seed,expected.randomCount,state.randomCount,expected.checksum,state.checksum);log(line);invalidate(8);return 1;
+    }
     if(!discardLiveQueue()) {invalidate(9);return 1;}
     replayBatch.clear();
     while(nextKind(Command) || nextKind(Bootstrap)) {
@@ -847,7 +922,10 @@ uint32_t __fastcall advanceHook(void* self,void*,uint32_t a,uint32_t b) {
     }
     uint32_t result=dispatchReplay(self,a,b);
     if(failed.load()) return 1;
-    if(!snapshot(self,state) || !getRecord(After,p,n) || n!=sizeof(State) || !same(state,*reinterpret_cast<const State*>(p))) {invalidate(8);return 1;}
+    if(!snapshot(self,state) || !getRecord(After,p,n) || n!=sizeof(State)) {invalidate(8);return 1;}
+    if(!same(state,*reinterpret_cast<const State*>(p))) {
+        auto expected=*(const State*)p;char line[240];sprintf_s(line,"After mismatch tick=%u/%u seed=%u/%u RNG=%u/%u checksum=%u/%u",expected.tick,state.tick,expected.seed,state.seed,expected.randomCount,state.randomCount,expected.checksum,state.checksum);log(line);invalidate(8);return 1;
+    }
     ++frames;return result;
 }
 
@@ -1054,6 +1132,13 @@ bool readInput(const wchar_t* path) {
         const unsigned char* p;uint32_t size;
         if(!getRecord(Begin,p,size) || size!=sizeof(savedInitial)) return false;
         memcpy(&savedInitial,p,size);
+        savedNames={1,{}};
+        if(nextKind(Names)) {
+            if(!getRecord(Names,p,size) || size!=sizeof(savedNames)) return false;
+            memcpy(&savedNames,p,size);
+            if(savedNames.version!=1) return false;
+            for(auto& name:savedNames.names) if(!memchr(name,0,sizeof(name))) return false;
+        }
         if(nextKind(Setup)) {
             if(!getRecord(Setup,p,size) || (size!=84 && size!=sizeof(savedSetup))) return false;
             memcpy(&savedSetup,p,size);if(size==84) legacyOptions(savedSetup);

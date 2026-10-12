@@ -46,6 +46,7 @@ class Trace:
     raw: bytes
     setup: bytes | None = None
     bootstrap: bytes | None = None
+    player_names: tuple | None = None
 
     @property
     def map_name(self):
@@ -64,7 +65,7 @@ def parse_trace(raw):
         raise ValueError('기록 크기 또는 형식 오류')
     offset, initial, pending, final = 8, None, None, None
     frames, commands, last_tick = [], 0, -1
-    setup, bootstrap = None, None
+    setup, bootstrap, player_names = None, None, None
     while offset < len(raw):
         if offset + 8 > len(raw):
             raise ValueError('잘린 기록 헤더')
@@ -87,6 +88,17 @@ def parse_trace(raw):
                 if b'\0' not in segment:
                     raise ValueError('지도 문자열 종료 누락')
                 segment.split(b'\0')[0].decode('cp949')
+        elif kind == 9:
+            if initial is None or player_names is not None or setup is not None or bootstrap is not None or pending is not None or frames or length!=516 or struct.unpack_from('<I',payload)[0]!=1:
+                raise ValueError('플레이어 아이디 기록 순서/크기 오류')
+            names=[]
+            for i in range(8):
+                value=payload[4+i*64:4+(i+1)*64]
+                if b'\0' not in value: raise ValueError('플레이어 아이디 종료 누락')
+                name=value.split(b'\0')[0].decode('cp949')
+                if any(ord(c)<32 or ord(c)==127 for c in name): raise ValueError('플레이어 아이디 제어 문자 오류')
+                names.append(name)
+            player_names=tuple(names)
         elif kind == 7:
             if initial is None or setup is not None or pending is not None or frames or length not in (SETUP.size, SETUP.size+16):
                 raise ValueError('자동 경기 설정 순서/크기 오류')
@@ -147,7 +159,7 @@ def parse_trace(raw):
             raise ValueError('알 수 없는 기록 종류')
     if initial is None or final is None:
         raise ValueError('미완성 경기 기록')
-    return Trace(initial, tuple(frames), final, commands, raw, setup, bootstrap)
+    return Trace(initial, tuple(frames), final, commands, raw, setup, bootstrap, player_names)
 
 def native_dir():
     if getattr(sys, 'frozen', False):
@@ -278,8 +290,6 @@ def stage_playback(path, game, store):
     m = validate(path)
     if m['adapter_id'] != ADAPTER or m['game_sha256'] != GAME_HASH or m['rules_sha256'] != RULES:
         raise ValueError('게임 빌드 또는 기록 규칙이 이 재생 어댑터와 호환되지 않습니다')
-    if not hmac.compare_digest(m.get('local_signature',''),_signature(_key(store.root),m)):
-        raise ValueError('외부/변경된 명령 데이터는 아직 재생할 수 없습니다. 이 PC에서 직접 기록한 원본만 지원합니다.')
     with zipfile.ZipFile(path) as z:
         # Recheck the reopened archive: replacement after validate must not reach the engine.
         entries = z.infolist()
@@ -294,6 +304,10 @@ def stage_playback(path, game, store):
                 raise ValueError('검증 중 리플레이 데이터가 변경되었습니다')
         raw = z.read('commands.bin')
         trace = parse_trace(raw)
+        if (m.get('map_id')!=trace.map_name or m.get('frame_count')!=len(trace.frames) or
+            m.get('command_count')!=trace.commands or m.get('network_mode')!=trace.network_mode or
+            m.get('ticks')!=max(1,trace.final[0]-trace.frames[0][0][0]+1)):
+            raise ValueError('메타데이터와 실제 경기 기록 불일치')
         if z.read('initial.bin') != trace.initial:
             raise ValueError('초기 상태와 명령 기록 불일치')
         if trace.network_mode and trace.bootstrap is None:
@@ -302,11 +316,34 @@ def stage_playback(path, game, store):
         expected_checksums=b''.join(struct.pack('<2I',frame[0][0],frame[0][3]) for frame in trace.frames)
         if z.read('rng.bin')!=expected_rng or z.read('checksums.bin')!=expected_checksums:
             raise ValueError('틱 난수/검사 기록 불일치')
-    # Do not overwrite installed maps. The experimental bootstrap requires the existing identical map.
-    map_path=resolve_map(game,trace)
-    with map_path.open('rb') as f:
-        if hashlib.file_digest(f,'sha256').hexdigest()!=m['map_sha256']:
-            raise ValueError('설치된 지도와 기록 당시 지도 데이터가 다릅니다')
+        embedded_map=z.read('map.bin')
+    # Use the included map in a content-addressed user cache; preserve installed maps.
+    try:
+        map_path=resolve_map(game,trace)
+        identical=hashlib.sha256(map_path.read_bytes()).hexdigest()==m['map_sha256']
+    except ValueError:
+        identical=False
+    if not identical:
+        name=trace.map_name
+        if Path(name).name!=name or any(c in name for c in '/\\:') or not name.lower().endswith('.kfm'):
+            raise ValueError('포함된 지도 이름/경로 오류')
+        if (len(embedded_map)<108 or len(embedded_map)>64*1024*1024 or
+            not embedded_map.startswith(b'KUF Map File v0.67\0') or not 1<=struct.unpack_from('<I',embedded_map,0x2c)[0]<=8):
+            raise ValueError('포함된 지도 형식 오류')
+        folder=store.root/'Playback'/'Maps'/m['map_sha256'];folder.mkdir(parents=True,exist_ok=True)
+        if not folder.resolve().is_relative_to((store.root/'Playback'/'Maps').resolve()):
+            raise ValueError('지도 캐시 경로 탈출')
+        map_path=folder/name
+        if not map_path.resolve().is_relative_to(folder.resolve()): raise ValueError('지도 캐시 파일 경로 탈출')
+        if map_path.exists() and hashlib.sha256(map_path.read_bytes()).hexdigest()!=m['map_sha256']:
+            raise ValueError('지도 캐시 무결성 오류')
+        if not map_path.exists():
+            with map_path.open('xb') as f: f.write(embedded_map)
+        directory=(str(folder.resolve())+'\\').encode('cp949')
+        if len(directory)>255: raise ValueError('지도 캐시 경로가 너무 깁니다')
+        # Relocate only the loader path; preserve simulation state and command bytes.
+        relocated=bytearray(raw);relocated[36:292]=directory+bytes(256-len(directory))
+        raw=bytes(relocated);trace=parse_trace(raw)
     staging=store.root/'Playback';staging.mkdir(parents=True,exist_ok=True)
     target=staging/(uuid.uuid4().hex+'.trace')
     with target.open('xb') as f:
