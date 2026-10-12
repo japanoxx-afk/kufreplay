@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from replay_store import Store, validate, REQUIRED, ALLOWED, MAX_TOTAL, MAX_MANIFEST, atomic_json
 from updater import VERSION
+from diagnostics import archive_engine_log
 
 ADAPTER = 'kuf-steam-1.416-experimental-v1'
 GAME_HASH = '69f2575ad14c78d3c6f7c15d0187234be005f06abf095d3f1bd602f1c3722868'
@@ -313,6 +314,7 @@ def stage_playback(path, game, store):
     return target, trace
 
 def launch_engine(game, store, mode='record', replay=None):
+    archive_engine_log(store.root)
     game=Path(game).resolve()
     with game.open('rb') as f:
         if hashlib.file_digest(f,'sha256').hexdigest()!=GAME_HASH:

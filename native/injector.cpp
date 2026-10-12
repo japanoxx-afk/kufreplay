@@ -59,11 +59,6 @@ static bool imageMatches(HANDLE process,const std::wstring& path) {
     wchar_t actual[32768]{};DWORD size=32768;
     return QueryFullProcessImageNameW(process,0,actual,&size) && !_wcsicmp(actual,path.c_str());
 }
-static BOOL CALLBACK closeCompanionWindow(HWND window,LPARAM pid) {
-    DWORD owner=0;GetWindowThreadProcessId(window,&owner);
-    if(owner==(DWORD)pid) PostMessageW(window,WM_CLOSE,0,0);
-    return TRUE;
-}
 struct SessionWindow {DWORD pid;bool found;};
 static BOOL CALLBACK sessionWindow(HWND window,LPARAM data) {
     auto state=(SessionWindow*)data;DWORD pid=0;GetWindowThreadProcessId(window,&pid);
@@ -104,41 +99,10 @@ static int watchSession(const wchar_t* gamePath,DWORD pid,const wchar_t* dataRoo
         }
     }
     CloseHandle(game);
-    SessionLock lock;
-    std::wstring path=gamePath;
-    path=path.substr(0,path.find_last_of(L"\\/"))+L"\\LocusGameChain\\LocusGameChain.exe";
-    HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);
-    if(snapshot==INVALID_HANDLE_VALUE) return 1;
-    PROCESSENTRY32W entry{};entry.dwSize=sizeof(entry);
-    std::vector<std::pair<DWORD,HANDLE>> companions;
-    bool anotherGame=false;
-    for(BOOL more=Process32FirstW(snapshot,&entry);more;more=Process32NextW(snapshot,&entry)) {
-        if(!_wcsicmp(entry.szExeFile,L"KingdomUnderFire.exe")) {
-            HANDLE other=OpenProcess(SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION,FALSE,entry.th32ProcessID);
-            if(other) {anotherGame |= imageMatches(other,gamePath) && WaitForSingleObject(other,0)==WAIT_TIMEOUT;CloseHandle(other);}
-        } else if(!_wcsicmp(entry.szExeFile,L"LocusGameChain.exe")) {
-            HANDLE companion=OpenProcess(SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION|PROCESS_TERMINATE,FALSE,entry.th32ProcessID);
-            if(companion && imageMatches(companion,path)) companions.emplace_back(entry.th32ProcessID,companion);
-            else if(companion) CloseHandle(companion);
-        }
-    }
-    CloseHandle(snapshot);
-    for(const auto& companion:companions) {
-        if(!anotherGame) EnumWindows(closeCompanionWindow,(LPARAM)companion.first);
-    }
-    DWORD closed=0;
-    for(const auto& companion:companions) {
-        if(!anotherGame) {
-            // A held process handle prevents PID reuse from targeting an unrelated process.
-            if(WaitForSingleObject(companion.second,3000)==WAIT_TIMEOUT) TerminateProcess(companion.second,0);
-            if(WaitForSingleObject(companion.second,3000)==WAIT_OBJECT_0) ++closed;
-        }
-        CloseHandle(companion.second);
-    }
     std::wstring logPath=std::wstring(dataRoot)+L"\\session-cleanup.log";
     HANDLE log=CreateFileW(logPath.c_str(),FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_ALWAYS,0,nullptr);
     if(log!=INVALID_HANDLE_VALUE) {
-        char line[160]{};sprintf_s(line,"Game PID %lu exited; same-installation LocusGameChain closed=%lu; another game=%d\r\n",pid,closed,anotherGame?1:0);
+        char line[160]{};sprintf_s(line,"Game PID %lu exited; game-only session cleanup\r\n",pid);
         DWORD count=0;WriteFile(log,line,(DWORD)strlen(line),&count,nullptr);CloseHandle(log);
     }
     return 0;

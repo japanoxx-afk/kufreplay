@@ -9,6 +9,7 @@ from urllib.error import HTTPError
 from replay_store import Store
 from updater import VERSION, download_latest
 from engine import ADAPTER, launch_engine, collect_completed, process_alive, replay_time
+from diagnostics import create_report, log_error
 
 DEFAULT_GAME = Path(r'C:\Program Files (x86)\Steam\steamapps\common\Kingdom Under Fire War of Heroes\KingdomUnderFire.exe')
 
@@ -36,7 +37,7 @@ class Launcher:
         ttk.Label(outer, text='Steam 실행 + 싱글·멀티 자동 기록 · 실행 중인 게임은 먼저 닫으세요 · 계정 안내창은 ‘아니요’').pack(anchor='w', pady=(8,0))
         controls = ttk.Frame(outer)
         controls.pack(fill='x', pady=14)
-        for title, fn in [('폴더 열기', self.open_folder), ('리플레이 가져오기', self.import_replay), ('기존 폴더 이전', self.migrate), ('새로고침', self.refresh), ('런처 업데이트', self.update)]:
+        for title, fn in [('폴더 열기', self.open_folder), ('리플레이 가져오기', self.import_replay), ('기존 폴더 이전', self.migrate), ('새로고침', self.refresh), ('런처 업데이트', self.update), ('에러코드 폴더 열기', self.open_errors)]:
             ttk.Button(controls, text=title, command=fn).pack(side='left', padx=(0, 6))
         settings = ttk.Frame(outer)
         settings.pack(fill='x', pady=(0, 10))
@@ -84,6 +85,7 @@ class Launcher:
                 return self.store.listing(), completed, errors
             def done(result):
                 items, completed, errors=result
+                for error in errors: log_error(self.store.root,'capture-validation',error)
                 self.render(items)
                 self.status.set(f'{len(completed)}개 자동 저장' if not errors else '기록 검증 실패: '+ '; '.join(errors))
             self.work(run,done,key='collect',background=True)
@@ -115,6 +117,7 @@ class Launcher:
             self.work_key = None
             self.status.set(f'저장 폴더: {self.store.replays}')
             if error:
+                log_error(self.store.root,'launcher-task',error)
                 messagebox.showerror('작업 실패', str(error))
             else:
                 done(result)
@@ -175,6 +178,12 @@ class Launcher:
 
     def open_folder(self):
         os.startfile(self.store.replays)
+
+    def open_errors(self):
+        def done(folder):
+            os.startfile(folder)
+            self.status.set(f'제보용 로그 폴더: {folder}')
+        self.work(lambda:create_report(self.store.root),done,key='diagnostics')
 
     def import_replay(self):
         path = filedialog.askopenfilename(filetypes=[('KUF 리플레이', '*.kufreplay')])
