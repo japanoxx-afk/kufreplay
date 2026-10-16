@@ -150,18 +150,21 @@ uint32_t observerAudio(void* self,Audio original,uint32_t a,uint32_t b,int x,int
     return result;
 }
 using VoiceAudio=uint32_t(__thiscall*)(void*,uint32_t,uint32_t,uint32_t);
-uint32_t replayVoice(void* self,VoiceAudio original,uint32_t sound,uint32_t volume,uint32_t flags) {
-    // Verified voice-volume call sites only; never classify by numeric volume equality.
-    return original(self,sound,playback?0:volume,flags);
+uint32_t replayVoice(void* self,VoiceAudio original,uint32_t sound,uint32_t archive,uint32_t flags) {
+    // The second argument is a resource-file object, NOT volume: 5413be passes
+    // it to 5f6af0. Nulling it can break file loading and using the FX archive
+    // for death sounds cannot locate assets from the speech archive.
+    if(playback) return 0xffffffffu;
+    return original(self,sound,archive,flags);
 }
 uint32_t __fastcall replayVoiceHook(void* self,void*,uint32_t sound,uint32_t volume,uint32_t flags) {
     return replayVoice(self,(VoiceAudio)address(0x541a40),sound,volume,flags);
 }
-uint32_t replayDeathVolume(uint32_t volume) {return playback?at<uint32_t>(0xb8a1e0):volume;}
 uint32_t __fastcall replaySpatialVoiceHook(void* self,void*,uint32_t sound,uint32_t volume,int x,int y,uint32_t flags) {
     // Death events are handled before ownership/cooldown gates below. Remaining
     // spatial responses (e.g. forced acknowledgements) are dialogue, too.
-    return observerAudio(self,spatialAudio,sound,playback?0:volume,x,y,flags);
+    if(playback) return 0xffffffffu;
+    return observerAudio(self,spatialAudio,sound,volume,x,y,flags);
 }
 uint32_t replayUnitAudio(void* self,UnitAudio original,void* object,int event,uint32_t flags) {
     if(!playback || !active || event!=4 || GetCurrentThreadId()!=producer)
@@ -176,7 +179,7 @@ uint32_t replayUnitAudio(void* self,UnitAudio original,void* object,int event,ui
     uint32_t serial=observerDeathEvents.fetch_add(1);
     int count=at<int16_t>(0xb38f50+type*20+16);
     int first=at<int16_t>(0xb38f52+type*20+16);
-    if(count<=0 || count>16 || first<0 || !spatialAudio || !at<void*>(0xb83ab0)) return 0;
+    if(count<=0 || count>16 || first<0 || !spatialAudio || !at<void*>(0xb83ab0) || !at<void*>(0xb8a1e4)) return 0;
     for(int n=0;n<count;++n) {
         int variant=(serial+n)%count;
         // Same availability marker as native 521211/53d6a8. Retry available
@@ -184,7 +187,7 @@ uint32_t replayUnitAudio(void* self,UnitAudio original,void* object,int event,ui
         if(at<int16_t>(0xb39a52+type*44+variant*2)==-1) continue;
         ++observerDeathSubmitted;
         return observerAudio(at<void*>(0xb83ab0),spatialAudio,first+variant,
-            at<uint32_t>(0xb8a1e0),*(int*)(unit+0x18),*(int*)(unit+0x1c),0);
+            at<uint32_t>(0xb8a1e4),*(int*)(unit+0x18),*(int*)(unit+0x1c),0);
     }
     return 0;
 }
@@ -399,26 +402,55 @@ uint32_t __stdcall playbackClock() {
 struct ObserverPlayer {bool participant;int steel,gold,mana,population,capacity,farmers;};
 ObserverPlayer observerPlayers[8]{};
 PlayerNames savedNames{1,{}};
+bool copyPlayerName(const char* text,int length,char (&out)[64]) {
+    __try {
+        if(!text || length<1 || length>1024) return false;
+        unsigned n=(unsigned)std::min(length,63),end=0;
+        while(end<n) {
+            unsigned width=IsDBCSLeadByteEx(949,(BYTE)text[end])?2:1;
+            if(end+width>n || (BYTE)text[end]<32 || (BYTE)text[end]==127) break;
+            end+=width;
+        }
+        if(!end) return false;
+        memcpy(out,text,end);out[end]=0;return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
+}
+bool captureCStringName(void* field,char (&out)[64]) {
+    __try {
+        const char* text=*(const char**)field;
+        return text && copyPlayerName(text,*(const int*)(text-12),out);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
+}
+bool captureLobbyName(unsigned index,char (&out)[64]) {
+    __try {
+        auto lobby=(unsigned char*)at<void*>(0xbed230);
+        if(!lobby) return false;
+        int count=*(int*)(lobby+8);
+        if(count<1 || count>8 || index>=(unsigned)count) return false;
+        const char* text=*(const char**)(lobby+0x38+index*4);
+        if(!text) return false;
+        int length=0;while(length<=1024 && text[length]) ++length;
+        return copyPlayerName(text,length,out);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
+}
 void captureNames(void* self,PlayerNames& names) {
     names={1,{}};
     // 58ed30..58ed6d copies lobby names into eight CString fields at +500.
     // CString stores byte length at data-12; read bounded bytes, no game writes.
-    __try {
-        for(unsigned i=0;i<8;++i) {
-            auto text=*(const char**)((unsigned char*)self+0x500+i*4);
-            if(!text) continue;
-            int length=*(const int*)(text-12);
-            if(length<1 || length>1024) continue;
-            unsigned n=(unsigned)std::min(length,63),end=0;
-            while(end<n) {
-                unsigned width=IsDBCSLeadByteEx(949,(BYTE)text[end])?2:1;
-                if(end+width>n) break;
-                if((BYTE)text[end]<32 || (BYTE)text[end]==127) break;
-                end+=width;
-            }
-            memcpy(names.names[i],text,end);
+    for(unsigned i=0;i<8;++i) {
+        // Isolate invalid/empty slots: one unreadable CString must not discard
+        // all other players. Native 58ed30 uses these same lobby pointers.
+        captureCStringName((unsigned char*)self+0x500+i*4,names.names[i]);
+        if(base && self==at<void*>(0xb8282c) && at<uint16_t>(0xb83ad0)==1) {
+            char lobbyName[64]{};
+            if(captureLobbyName(i,lobbyName)) memcpy(names.names[i],lobbyName,64);
         }
-    } __except(EXCEPTION_EXECUTE_HANDLER) {names={1,{}};}
+    }
+}
+using AssignName=void(__thiscall*)(void*,const char*,int);
+void restorePlayerNames(void* self,AssignName assign) {
+    for(unsigned i=0;i<8;++i) if(savedNames.names[i][0])
+        assign((unsigned char*)self+0x500+i*4,savedNames.names[i],(int)strlen(savedNames.names[i]));
 }
 const char* observerName(unsigned player,char (&fallback)[16]) {
     if(player<8 && savedNames.names[player][0]) return savedNames.names[player];
@@ -740,7 +772,10 @@ uint32_t __fastcall initializeMapHook(void* self,void*,uint32_t a,uint32_t b) {
         }
         return initializeMap(self,a,b);
     }
-    if(savedInitial.networkMode!=1) return initializeMap(self,a,b);
+    if(savedInitial.networkMode!=1) {
+        uint32_t result=initializeMap(self,a,b);
+        restorePlayerNames(self,(AssignName)address(0x429000));return result;
+    }
     if(!hasBootstrap) {invalidate(14);return 0;}
     if(!inDispatch && savedInitial.state.checksum==0 && savedInitial.state.seed==0 && savedInitial.state.randomCount==0) {
         // The recorded session begins with an empty world. Command 1007 will
@@ -768,6 +803,7 @@ uint32_t __fastcall initializeMapHook(void* self,void*,uint32_t a,uint32_t b) {
         result=initializeMap(self,a,b);
     } __finally {at<unsigned char>(0xb83ad0)=mode;}
     } __except(EXCEPTION_EXECUTE_HANDLER) {invalidate(13);return 0;}
+    restorePlayerNames(self,(AssignName)address(0x429000));
     return result;
 }
 
@@ -1051,6 +1087,7 @@ uint32_t __fastcall advanceHook(void* self,void*,uint32_t a,uint32_t b) {
             if(networkMode==0 && validSetup(setup)) emit(Setup,&setup,sizeof(setup));
             if(networkMode==1 && hasCapturedBootstrap) {emit(Bootstrap,&capturedBootstrap,sizeof(capturedBootstrap));bootstrapEmitted=true;}
         }
+        if(playback) restorePlayerNames(self,(AssignName)address(0x429000));
         active=true;++session;frames=0;
     }
     if(!playback) {
@@ -1259,7 +1296,9 @@ bool verifyText() {
     wchar_t path[MAX_PATH];if(!GetModuleFileNameW(nullptr,path,MAX_PATH)) return false;
     HANDLE f=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr);
     if(f==INVALID_HANDLE_VALUE) return false;
-    std::vector<unsigned char> disk(8352688);DWORD count=0;
+    LARGE_INTEGER size{};
+    if(!GetFileSizeEx(f,&size) || (size.QuadPart!=8352688 && size.QuadPart!=8352176)) {CloseHandle(f);return false;}
+    std::vector<unsigned char> disk((size_t)size.QuadPart);DWORD count=0;
     bool ok=ReadFile(f,disk.data(),(DWORD)disk.size(),&count,nullptr) && count==disk.size();CloseHandle(f);
     if(!ok) return false;
     auto dos=(IMAGE_DOS_HEADER*)disk.data();auto nt=(IMAGE_NT_HEADERS32*)(disk.data()+dos->e_lfanew);
@@ -1432,7 +1471,7 @@ DWORD WINAPI worker(void* argument) {
             if(ok) {spatialLoopAudio=(Audio)patchEntry(0x5410a0,audioPrefix,sizeof(audioPrefix),(void*)spatialLoopAudioHook);ok=spatialLoopAudio!=nullptr;}
             if(ok) ok=patchCall(0x540eb0,0x4369f0,(void*)observerAudioVisibility);
             if(ok) ok=patchCall(0x5410e0,0x4369f0,(void*)observerAudioVisibility);
-            // These calls load the speech volume b8a1e4. Effects load b8a1e0.
+            // These calls pass speech resource archive b8a1e4; FX uses b8a1e0.
             for(uint32_t call:{0x4656eau,0x480f09u,0x48cc48u,0x48cecfu,0x48cf4cu,0x49179bu,
                 0x4ad7a1u,0x4ad7c3u,0x4c1d0fu,0x4c54e3u,0x4f5626u,0x5011deu,0x5213ebu,
                 0x52f377u,0x5d79cau,0x5e0ffcu,0x5e8a05u})

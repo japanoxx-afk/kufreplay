@@ -16,10 +16,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from replay_store import Store, validate, REQUIRED, ALLOWED, MAX_TOTAL, MAX_MANIFEST, atomic_json
 from updater import VERSION
-from diagnostics import archive_engine_log
+from diagnostics import archive_engine_log, game_identity, record_game_identity
 
 ADAPTER = 'kuf-steam-1.416-experimental-v1'
 GAME_HASH = '69f2575ad14c78d3c6f7c15d0187234be005f06abf095d3f1bd602f1c3722868'
+UPDATED_GAME_HASH = 'd72bc8814c4e3c5614b893c79fde5ac13bf17fcaa7f830dff8f4e240126e5cfc'
+
+def supported_game_hash(digest):
+    return digest in (GAME_HASH, UPDATED_GAME_HASH)
+
 RULES = hashlib.sha256(b'KUFReplay-native-command-adapter-v1-singleplayer-same-initial-state').hexdigest()
 MAGIC = b'KUFTRC01'
 MAX_TRACE = 128 * 1024 * 1024
@@ -31,7 +36,7 @@ COMMAND = struct.Struct('<4I')
 
 def replay_time(metadata):
     """Supported KUF builds advance one simulation tick every 30 milliseconds."""
-    if metadata.get('adapter_id') == ADAPTER and metadata.get('game_sha256') == GAME_HASH:
+    if metadata.get('adapter_id') == ADAPTER and supported_game_hash(metadata.get('game_sha256')):
         seconds = metadata['ticks'] * metadata.get('tick_interval_ms',30) // 1000
     else:
         seconds = metadata['ticks'] // metadata['tick_rate']
@@ -204,7 +209,7 @@ def package_capture(source, game, store, recovery=None):
     trace = parse_trace(source.read_bytes())
     with Path(game).open('rb') as f:
         game_hash = hashlib.file_digest(f,'sha256').hexdigest()
-    if game_hash != GAME_HASH:
+    if not supported_game_hash(game_hash):
         raise ValueError('기록 대상 게임 빌드 불일치')
     map_path = resolve_map(game, trace)
     if map_path.stat().st_size > 64*1024*1024:
@@ -216,7 +221,7 @@ def package_capture(source, game, store, recovery=None):
     stamp = datetime.fromtimestamp(source.stat().st_mtime,timezone.utc).isoformat()
     interval=BOOTSTRAP.unpack(trace.bootstrap)[7] if trace.bootstrap else 30
     playable=not trace.network_mode or trace.bootstrap is not None
-    metadata = {'format_version':1, 'complete':True, 'game_sha256':GAME_HASH,
+    metadata = {'format_version':1, 'complete':True, 'game_sha256':game_hash,
                 'rules_sha256':RULES, 'map_sha256':hashes['map.bin'], 'game_version':'Steam 1.416',
                 'rules_version':'native-v1-experimental', 'adapter_id':ADAPTER, 'recorded_at':stamp,
                 'recorder_version':VERSION,
@@ -288,7 +293,7 @@ def recover_closed_capture(source, game, store):
 
 def stage_playback(path, game, store):
     m = validate(path)
-    if m['adapter_id'] != ADAPTER or m['game_sha256'] != GAME_HASH or m['rules_sha256'] != RULES:
+    if m['adapter_id'] != ADAPTER or not supported_game_hash(m['game_sha256']) or m['rules_sha256'] != RULES:
         raise ValueError('게임 빌드 또는 기록 규칙이 이 재생 어댑터와 호환되지 않습니다')
     with zipfile.ZipFile(path) as z:
         # Recheck the reopened archive: replacement after validate must not reach the engine.
@@ -353,9 +358,12 @@ def stage_playback(path, game, store):
 def launch_engine(game, store, mode='record', replay=None):
     archive_engine_log(store.root)
     game=Path(game).resolve()
-    with game.open('rb') as f:
-        if hashlib.file_digest(f,'sha256').hexdigest()!=GAME_HASH:
-            raise ValueError('지원하지 않는 게임 SHA256입니다. 후킹하지 않았습니다.')
+    identity=game_identity(game)
+    record_game_identity(store.root,identity)
+    if not supported_game_hash(identity.get('sha256')):
+        raise ValueError('GB01: 지원하지 않는 게임 빌드입니다. 후킹하지 않았습니다.\n'
+                         f"파일: {game}\nSHA256: {identity.get('sha256', '읽기 실패')}\n"
+                         'Steam 파일 무결성 확인 후 다시 시도하거나 에러코드 폴더의 game-build.json을 제보해 주세요.')
     directory=native_dir()
     helper,dll=directory/'KUFReplayInjector.exe',directory/'KUFReplayEngine.dll'
     if not helper.exists() or not dll.exists():

@@ -217,7 +217,8 @@ class Launcher:
         def done(folder):
             os.startfile(folder)
             self.status.set(f'제보용 로그 폴더: {folder}')
-        self.work(lambda:create_report(self.store.root),done,key='diagnostics')
+        game=self.game_path.get()
+        self.work(lambda:create_report(self.store.root,game),done,key='diagnostics')
 
     def import_replay(self):
         path = filedialog.askopenfilename(filetypes=[('KUF 리플레이', '*.kufreplay')])

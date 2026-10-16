@@ -1,9 +1,37 @@
 """Local, bounded diagnostic reports for user-submitted bug reports."""
 import json
 import shutil
+import hashlib
+import struct
 from datetime import datetime
 from pathlib import Path
 from updater import VERSION
+
+def game_identity(path):
+    path=Path(path).resolve()
+    result={'path':str(path)}
+    try:
+        result['bytes']=path.stat().st_size
+        with path.open('rb') as f:
+            result['sha256']=hashlib.file_digest(f,'sha256').hexdigest()
+            f.seek(0);header=f.read(64)
+            if header[:2]==b'MZ' and len(header)==64:
+                pe=struct.unpack_from('<I',header,60)[0]
+                if pe<=result['bytes']-24:
+                    f.seek(pe);coff=f.read(24)
+                    if coff[:4]==b'PE\0\0':
+                        result['machine']=hex(struct.unpack_from('<H',coff,4)[0])
+                        result['pe_timestamp']=struct.unpack_from('<I',coff,8)[0]
+    except OSError as error:
+        result['error']=str(error)
+    return result
+
+def record_game_identity(root,identity):
+    try:
+        folder=Path(root)/'Errors';folder.mkdir(parents=True,exist_ok=True)
+        (folder/'game-build.json').write_text(json.dumps(identity,ensure_ascii=False,indent=2),encoding='utf-8')
+    except OSError as error:
+        log_error(root,'game-build-report',error)
 
 def log_error(root, category, error):
     try:
@@ -25,10 +53,11 @@ def archive_engine_log(root):
     except OSError as error:
         log_error(root,'log-archive',error)
 
-def create_report(root):
+def create_report(root,game=None):
     root=Path(root);errors=root/'Errors';errors.mkdir(parents=True,exist_ok=True)
     report=errors/datetime.now().strftime('Report-%Y%m%d-%H%M%S-%f');report.mkdir()
-    sources=[root/'engine.log',root/'session-cleanup.log',errors/'launcher-errors.log']
+    if game: record_game_identity(root,game_identity(game))
+    sources=[root/'engine.log',root/'session-cleanup.log',errors/'launcher-errors.log',errors/'game-build.json']
     sources+=sorted((errors/'History').glob('*.log'),key=lambda p:p.stat().st_mtime,reverse=True)[:5]
     sources+=sorted((root/'CaptureInbox').glob('*.rejected.json'),key=lambda p:p.stat().st_mtime,reverse=True)[:20]
     for source in sources:

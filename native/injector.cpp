@@ -15,7 +15,7 @@ static bool knownGame(const wchar_t* path) {
     HANDLE f=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr);
     if(f==INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER size{}; GetFileSizeEx(f,&size);
-    if(size.QuadPart!=8352688) { CloseHandle(f); return false; }
+    if(size.QuadPart!=8352688 && size.QuadPart!=8352176) { CloseHandle(f); return false; }
     BCRYPT_ALG_HANDLE alg=nullptr; BCRYPT_HASH_HANDLE hash=nullptr;
     DWORD objectSize=0,used=0;
     bool ok=BCryptOpenAlgorithmProvider(&alg,BCRYPT_SHA256_ALGORITHM,nullptr,0)>=0;
@@ -34,7 +34,9 @@ static bool knownGame(const wchar_t* path) {
     if(alg) BCryptCloseAlgorithmProvider(alg,0);
     CloseHandle(f);
     const unsigned char expected[32]={0x69,0xf2,0x57,0x5a,0xd1,0x4c,0x78,0xd3,0xc6,0xf7,0xc1,0x5d,0x01,0x87,0x23,0x4b,0xe0,0x05,0xf0,0x6a,0xbf,0x09,0x5d,0x3f,0x1b,0xd6,0x02,0xf1,0xc3,0x72,0x28,0x68};
-    return ok && !memcmp(expected,result,32);
+    const unsigned char updated[32]={0xd7,0x2b,0xc8,0x81,0x4c,0x4e,0x3c,0x56,0x14,0xb8,0x93,0xc7,0x9f,0xde,0x5a,0xc1,0x3b,0xf1,0x7f,0xca,0xa7,0xf8,0x30,0xdf,0xf8,0xf4,0xe2,0x40,0x12,0x6e,0x5c,0xfc};
+    return ok && ((size.QuadPart==8352688 && !memcmp(expected,result,32)) ||
+                  (size.QuadPart==8352176 && !memcmp(updated,result,32)));
 }
 
 static bool gameRunning() {

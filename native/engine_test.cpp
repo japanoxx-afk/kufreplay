@@ -68,11 +68,18 @@ bool mapExceptionRestored(void* self) {
 }
 uint32_t __fastcall fakeResultRender(void*,void*) {return 123;}
 uint32_t __fastcall fakeFullSurface(void*,void*) {return 456;}
-uint32_t __fastcall fakeVoiceVolume(void*,void*,uint32_t,uint32_t volume,uint32_t) {return volume;}
-uint32_t deathSound=0,deathVolume=0,unitAudioCalls=0,originCalls=0,regionCalls=0;
+uint32_t voiceLoadCalls=0;
+uint32_t __fastcall fakeVoiceArchive(void*,void*,uint32_t,uint32_t archive,uint32_t) {++voiceLoadCalls;return archive;}
+void* nameDestination[8]{};char assignedNames[8][64]{};unsigned nameAssignments=0;
+void __fastcall fakeAssignName(void* self,void*,const char* text,int length) {
+    if(nameAssignments>=8 || length<1 || length>63) exit(2);
+    nameDestination[nameAssignments]=self;
+    memcpy(assignedNames[nameAssignments],text,length);++nameAssignments;
+}
+uint32_t deathSound=0,deathArchive=0,unitAudioCalls=0,originCalls=0,regionCalls=0;
 uint32_t __fastcall fakeUnitAudio(void*,void*,void*,int,uint32_t) {++unitAudioCalls;return 99;}
 uint32_t __fastcall fakeDeathAudio(void*,void*,uint32_t sound,uint32_t volume,int,int,uint32_t) {
-    deathSound=sound;deathVolume=volume;return 123;
+    deathSound=sound;deathArchive=volume;return 123;
 }
 void __fastcall fakeCameraOrigin(void* self,void*,int x,int y) {
     ++originCalls;((int*)self)[0]=x;((int*)self)[1]=y;
@@ -179,9 +186,9 @@ int main() {
     require(observerDisplayName("ab",shortDisplay)==2 && !strcmp(shortDisplay,"ab"),"short IDs keep compact display");
     require(observerDisplayName("abcdefghijklmnopq",shortDisplay)==18 && !strcmp(shortDisplay,"abcdefghijklmnop.."),"long IDs truncate consistently for column sizing");
     playback=true;
-    require(replayVoice(nullptr,(VoiceAudio)fakeVoiceVolume,500,100,0)==0,"replay unit dialogue is muted");
+    require(replayVoice(nullptr,(VoiceAudio)fakeVoiceArchive,500,100,0)==0xffffffffu && voiceLoadCalls==0,"replay dialogue skips loading rather than passing a null resource archive");
     playback=false;
-    require(replayVoice(nullptr,(VoiceAudio)fakeVoiceVolume,500,100,0)==100,"normal gameplay speech volume remains unchanged");
+    require(replayVoice(nullptr,(VoiceAudio)fakeVoiceArchive,500,100,0)==100,"normal gameplay speech volume remains unchanged");
     RECT cursorClipBefore{},cursorClipAfter{};
     GetClipCursor(&cursorClipBefore);
     int cursorCount=ShowCursor(FALSE);
@@ -195,11 +202,7 @@ int main() {
     base=(uintptr_t)VirtualAlloc(nullptr,0x882000,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
     require(base!=0,"fixture memory");
     textBase=base;textSize=0x882000;expectedText.resize(textSize);
-    at<uint32_t>(0xb8a1e0)=120;playback=true;
-    require(replayDeathVolume(0)==120,"replay death event uses effects volume despite muted speech");
-    at<uint32_t>(0xb8a1e0)=0;
-    require(replayDeathVolume(120)==0,"death effects respect user effects mute");
-    playback=false;require(replayDeathVolume(90)==90,"normal gameplay death volume unchanged");
+    playback=false;
     {
         unsigned char dyingUnit[0x80]{},playerAudio[0x600]{};
         *(int16_t*)(dyingUnit+4)=0;*(int16_t*)(dyingUnit+8)=2;
@@ -207,17 +210,32 @@ int main() {
         at<int16_t>(0xb38f50+16)=2;at<int16_t>(0xb38f52+16)=2508;
         at<int16_t>(0xb39a52)=-1;at<int16_t>(0xb39a54)=0;
         at<void*>(0xb83ab0)=playerAudio;spatialAudio=(Audio)fakeDeathAudio;
-        at<uint32_t>(0xb8a1e0)=120;at<uint32_t>(0xb8a1e4)=0;
+        at<uint32_t>(0xb8a1e0)=0x11110000;at<uint32_t>(0xb8a1e4)=0x22220000;
         at<uint32_t>(0xb3e648)=777;at<uint32_t>(0xbed1e8)=888;
         playback=true;active=true;producer=GetCurrentThreadId();
         unsigned char savedPlayer[sizeof(playerAudio)];memcpy(savedPlayer,playerAudio,sizeof(playerAudio));
         require(replayUnitAudio(playerAudio,(UnitAudio)fakeUnitAudio,dyingUnit,4,0)==123,"observer hears remote owner's death without native ownership or speech gate");
-        require(deathSound==2509 && deathVolume==120 && unitAudioCalls==0,"available death variant uses effects volume and skips unavailable variant");
+        require(deathSound==2509 && deathArchive==0x22220000 && unitAudioCalls==0,"death sound keeps original speech archive containing pe109.wav and skips unavailable variant");
         require(!memcmp(savedPlayer,playerAudio,sizeof(playerAudio)) && at<uint32_t>(0xb3e648)==777 && at<uint32_t>(0xbed1e8)==888,"death playback preserves player caches and both RNG states");
         require(replayUnitAudio(playerAudio,(UnitAudio)fakeUnitAudio,dyingUnit,1,0)==99,"non-death response retains native handling");
         playback=false;
         require(replayUnitAudio(playerAudio,(UnitAudio)fakeUnitAudio,dyingUnit,4,0)==99,"normal game death handling remains native");
         active=false;producer=0;at<void*>(0xb83ab0)=nullptr;spatialAudio=nullptr;
+    }
+    {
+        unsigned char gameNames[0x520]{},lobby[0x58]{};
+        char nameA[]="superchosun",nameB[]="james";
+        *(int*)(lobby+8)=2;*(char**)(lobby+0x38)=nameA;*(char**)(lobby+0x3c)=nameB;
+        at<void*>(0xb8282c)=gameNames;at<void*>(0xbed230)=lobby;at<uint16_t>(0xb83ad0)=1;
+        *(void**)(gameNames+0x508)=(void*)1; // Unreadable third slot does not erase valid names.
+        PlayerNames captured{};captureNames(gameNames,captured);
+        require(!strcmp(captured.names[0],nameA) && !strcmp(captured.names[1],nameB) && !captured.names[2][0],"capture actual lobby names even with empty game strings and invalid other slot");
+        savedNames=captured;restorePlayerNames(gameNames,(AssignName)fakeAssignName);
+        require(nameAssignments==2 && nameDestination[0]==gameNames+0x500 && nameDestination[1]==gameNames+0x504 && !strcmp(assignedNames[0],nameA) && !strcmp(assignedNames[1],nameB),"restore native message recipient names with CString assignment and exact player slots");
+        char fallback[16];require(!strcmp(observerName(0,fallback),nameA) && !strcmp(observerName(1,fallback),nameB),"resource overlay uses same captured IDs");
+        savedNames={1,{}};restorePlayerNames(gameNames,(AssignName)fakeAssignName);
+        require(nameAssignments==2,"legacy replay without names does not assign invented identities");
+        at<void*>(0xb8282c)=nullptr;at<void*>(0xbed230)=nullptr;at<uint16_t>(0xb83ad0)=0;
     }
     {
         const unsigned char safeFileQuery[]={0x8b,0x49,0x04,0x85,0xc9,0x75,0x03,0x32,0xc0,0xc3,0x8b,0x01,0x8b,0x40,0x1c,0xff,0xe0};
