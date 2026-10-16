@@ -26,6 +26,7 @@ struct ReplayCommand { CommandHeader header; const unsigned char* bytes; };
 std::vector<ReplayCommand> replayBatch;
 size_t replayPop=0,replayApply=0;
 uint32_t session=0,frames=0;
+uint32_t populationOrdinal=0,populationSamples=0;
 Initial initial{};
 State lastBefore{};
 Initial savedInitial{};
@@ -36,6 +37,8 @@ bool hasCapturedBootstrap=false,hasBootstrap=false;
 bool bootstrapEmitted=false;
 bool restoredEmptyNetworkInitial=false;
 bool exitConfirmationOpen=false,playbackExitRequested=false;
+bool playbackResultsStarted=false;
+using ChangeState=void(__thiscall*)(void*,uint32_t);
 std::vector<unsigned char> input,expectedText;
 size_t cursor=8;
 uintptr_t textBase=0;
@@ -60,14 +63,41 @@ Advance initializeMap=nullptr;
 Apply apply=nullptr;
 Process process=nullptr;
 Process resultRender=nullptr;
+using ResultButton=uint32_t(__thiscall*)(void*,uint32_t);
+ResultButton resultButton=nullptr;
+using SpriteFrame=void(__thiscall*)(void*,int,int);
 Process applicationProcess=nullptr;
+using CameraInput=void(__thiscall*)(void*);
+CameraInput cameraInput=nullptr;
 Process prepareDisplay=nullptr,drawDisplay=nullptr;
 Process interfaceRender=nullptr;
+Process buildingRender=nullptr;
+Process buildingBodyPrepare=nullptr;
+std::atomic<uint32_t> observerBuildingBodies{0},observerConstructionDraws{0};
+Process characterRender=nullptr;
+using MinimapAlarmBlit=void(__cdecl*)(const void*,void*,int,int,int);
+MinimapAlarmBlit minimapAlarmBlit=nullptr;
+void __cdecl replayMinimapAlarmBlit(const void* image,void* surface,int pitch,int width,int height) {
+    // Only the KUFSMALLMAPEFFECT_RENDERER call site is redirected. Its timer
+    // and expired-effect cleanup still run; terrain/unit/camera drawing is intact.
+    if(playback && active) return;
+    minimapAlarmBlit(image,surface,pitch,width,height);
+}
+using TextDraw=uint32_t(__thiscall*)(void*,const char*,void*,int,int,int,int);
+TextDraw textDraw=nullptr;
+using GlyphDraw=uint32_t(__cdecl*)(const uint16_t*,int,int,int,int,void*,int);
+GlyphDraw glyphDraw=nullptr;
+unsigned observerIdTintDepth=0;
+uint16_t observerIdTintColor=0;
+std::atomic<uint32_t> observerIdPaints{0},observerIdGlyphs{0},observerIdGlyphFailures{0};
 using Audio=uint32_t(__thiscall*)(void*,uint32_t,uint32_t,int,int,uint32_t);
 Audio spatialAudio=nullptr,spatialLoopAudio=nullptr;
+Process spatialUpdate=nullptr;
+int observerMixerWidth=0;
 using UnitAudio=uint32_t(__thiscall*)(void*,void*,int,uint32_t);
 UnitAudio localUnitAudio=nullptr,remoteUnitAudio=nullptr;
 std::atomic<uint32_t> observerDeathEvents{0},observerDeathSubmitted{0};
+std::atomic<uint32_t> observerDeathAccepted{0},observerDeathRejected{0},observerDeathOnscreen{0},observerLastDeath{0};
 unsigned observerAudioDepth=0;
 std::atomic<uint32_t> observerAudioCalls{0},observerAudioOnscreen{0},observerAudioRejected{0},observerAudioDisabled{0},observerAudioCameraFixes{0},observerAudioTick{0};
 using Selection=uint32_t(__thiscall*)(void*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
@@ -77,7 +107,7 @@ uint32_t __fastcall selectionHook(void* self,void*,uint32_t a,uint32_t b,uint32_
     return originalSelection(self,a,b,c,d,e,f,g,h);
 }
 Destroy destroy=nullptr;
-struct VisibilityBackup {unsigned char* object;unsigned char fog;unsigned char invisible;};
+struct VisibilityBackup {unsigned char* object;unsigned char fog;unsigned char invisible;unsigned char buildingDraw;bool building;};
 VisibilityBackup visibilityBackups[11264]{};
 unsigned visibilityCount=0,displayDepth=0;
 unsigned char savedFog=0;
@@ -149,12 +179,40 @@ uint32_t observerAudio(void* self,Audio original,uint32_t a,uint32_t b,int x,int
     }
     return result;
 }
+uint32_t observerAudioUpdate(void* self,Process original) {
+    if(!playback || !active || GetCurrentThreadId()!=producer) return original(self);
+    int width=at<int>(0xbf2588),x=at<int>(0xb869c4),y=at<int>(0xb869c8);uint32_t result=0;
+    __try {
+        if(!showObserverHud) at<int>(0xbf2588)=at<int>(0xbf2578)-at<int>(0xbf2580);
+        auto game=(unsigned char*)at<void*>(0xb8282c);
+        if(game && *(int*)(game+0x9c4)>=128 && *(int*)(game+0x9c8)>=128) {
+            at<int>(0xb869c4)=*(int*)(game+0x9c4);at<int>(0xb869c8)=*(int*)(game+0x9c8);
+        }
+        if(observerMixerWidth!=at<int>(0xbf2588)) {
+            // Native 540c26 only checks camera movement, ignoring HUD width.
+            *(int*)((unsigned char*)self+0xfcd20)=(int)0x80000000u;
+            observerMixerWidth=at<int>(0xbf2588);
+        }
+        result=original(self);
+    } __finally {at<int>(0xbf2588)=width;at<int>(0xb869c4)=x;at<int>(0xb869c8)=y;}
+    return result;
+}
+uint32_t __fastcall spatialUpdateHook(void* self,void*) {return observerAudioUpdate(self,spatialUpdate);}
 using VoiceAudio=uint32_t(__thiscall*)(void*,uint32_t,uint32_t,uint32_t);
+bool replayDeathSound(uint32_t sound) {
+    if(!base) return false;
+    // fx.map explicitly labels these native event-4 ranges as ';dead'.
+    for(unsigned type=0;type<116;++type) {
+        int count=at<int16_t>(0xb38f50+type*20+16),first=at<int16_t>(0xb38f52+type*20+16);
+        if(count>0 && count<=16 && first>=0 && sound>=(uint32_t)first && sound<(uint32_t)(first+count)) return true;
+    }
+    return false;
+}
 uint32_t replayVoice(void* self,VoiceAudio original,uint32_t sound,uint32_t archive,uint32_t flags) {
     // The second argument is a resource-file object, NOT volume: 5413be passes
     // it to 5f6af0. Nulling it can break file loading and using the FX archive
     // for death sounds cannot locate assets from the speech archive.
-    if(playback) return 0xffffffffu;
+    if(playback && !(active && replayDeathSound(sound))) return 0xffffffffu;
     return original(self,sound,archive,flags);
 }
 uint32_t __fastcall replayVoiceHook(void* self,void*,uint32_t sound,uint32_t volume,uint32_t flags) {
@@ -163,7 +221,7 @@ uint32_t __fastcall replayVoiceHook(void* self,void*,uint32_t sound,uint32_t vol
 uint32_t __fastcall replaySpatialVoiceHook(void* self,void*,uint32_t sound,uint32_t volume,int x,int y,uint32_t flags) {
     // Death events are handled before ownership/cooldown gates below. Remaining
     // spatial responses (e.g. forced acknowledgements) are dialogue, too.
-    if(playback) return 0xffffffffu;
+    if(playback && !(active && replayDeathSound(sound))) return 0xffffffffu;
     return observerAudio(self,spatialAudio,sound,volume,x,y,flags);
 }
 uint32_t replayUnitAudio(void* self,UnitAudio original,void* object,int event,uint32_t flags) {
@@ -186,8 +244,17 @@ uint32_t replayUnitAudio(void* self,UnitAudio original,void* object,int event,ui
         // variants without touching native RNG, player response caches or units.
         if(at<int16_t>(0xb39a52+type*44+variant*2)==-1) continue;
         ++observerDeathSubmitted;
-        return observerAudio(at<void*>(0xb83ab0),spatialAudio,first+variant,
+        observerLastDeath=first+variant;
+        auto game=(unsigned char*)at<void*>(0xb8282c);
+        int cameraX=game?*(int*)(game+0x9c4):at<int>(0xb869c4);
+        int cameraY=game?*(int*)(game+0x9c8):at<int>(0xb869c8);
+        int width=showObserverHud?at<int>(0xbf2588):at<int>(0xbf2578)-at<int>(0xbf2580);
+        int x=*(int*)(unit+0x18),y=*(int*)(unit+0x1c);
+        if(x>=cameraX && (int64_t)x<(int64_t)cameraX+width && y>=cameraY && (int64_t)y<(int64_t)cameraY+at<int>(0xbf258c)) ++observerDeathOnscreen;
+        uint32_t result=observerAudio(at<void*>(0xb83ab0),spatialAudio,first+variant,
             at<uint32_t>(0xb8a1e4),*(int*)(unit+0x18),*(int*)(unit+0x1c),0);
+        if(result==0xffffffffu) ++observerDeathRejected;else ++observerDeathAccepted;
+        return result;
     }
     return 0;
 }
@@ -250,6 +317,22 @@ uint32_t drawExpandedTerrain(void* self,Process original) {
     return result;
 }
 
+bool observerNeedsBuildingBody(unsigned char* object) {
+    if(!object || *(int16_t*)(object+6)!=1 || *(int16_t*)(object+0x4c)!=0 ||
+       !*(uint16_t*)(object+0x14) || object[0x14d8] || *(int16_t*)(object+0x14a6)!=0) return false;
+    // Exact native 47aa6f..47aaa3 readiness and state exclusions. Never paint
+    // a completed body over construction scaffolding or destruction states.
+    uint16_t state=*(uint16_t*)(object+0xc);
+    return state!=0x3e80 && state!=0x283c && state!=0x2a30 && state!=0x27d8;
+}
+void prepareObserverBuildingBody(unsigned char* object,Process prepare) {
+    if(!playback || !active || inDispatch || GetCurrentThreadId()!=producer || !displayDepth || !observerNeedsBuildingBody(object)) return;
+    prepare(object);
+    // Native 478440 owns/initializes graphics at +168 and sets +14d8 ready.
+    // Keep that resource-cache readiness truthful; it is not explored/detection
+    // state. The normal upgrade/reset/destructor paths retain ownership.
+    observerBuildingBodies.fetch_add(1,std::memory_order_relaxed);
+}
 void enterObserverDisplay() {
     if(displayDepth++) return;
     savedFog=at<unsigned char>(0xb3ba61);visibilityCount=0;
@@ -273,7 +356,9 @@ void enterObserverDisplay() {
         for(uint32_t i=0;i<count && index<11264;++i) {
             auto unit=((unsigned char**)(bytes+0x2c38))[index];
             if(unit) {
-                visibilityBackups[visibilityCount++]={unit,unit[0x6b],unit[0x69]};
+                bool building=*(int16_t*)(unit+6)==1;
+                visibilityBackups[visibilityCount++]={unit,unit[0x6b],unit[0x69],building?unit[0x14d9]:(unsigned char)0,building};
+                if(building) unit[0x14d9]=1; // 47afdd construction/completed-detail draw gate.
                 unit[0x6b]=0; // The native display-only fog cache (517560/496f26).
                 unit[0x69]=0; // Native invisibility gates, scoped strictly to display callbacks.
             }
@@ -281,6 +366,8 @@ void enterObserverDisplay() {
         }
     }
     at<unsigned char>(0xb3ba61)=1;
+    if(buildingBodyPrepare) for(unsigned i=0;i<visibilityCount;++i)
+        if(visibilityBackups[i].building) prepareObserverBuildingBody(visibilityBackups[i].object,buildingBodyPrepare);
 }
 
 void leaveObserverDisplay() {
@@ -288,6 +375,7 @@ void leaveObserverDisplay() {
     for(unsigned i=0;i<visibilityCount;++i) {
         visibilityBackups[i].object[0x6b]=visibilityBackups[i].fog;
         visibilityBackups[i].object[0x69]=visibilityBackups[i].invisible;
+        if(visibilityBackups[i].building) visibilityBackups[i].object[0x14d9]=visibilityBackups[i].buildingDraw;
     }
     visibilityCount=0;at<unsigned char>(0xb3ba61)=savedFog;
     at<int>(0xbf2588)=savedViewportWidth;
@@ -308,6 +396,66 @@ uint32_t __fastcall drawDisplayHook(void* self,void*) {
     if(playback && active && showObserverHud && observerHudRedrawFrames) --observerHudRedrawFrames;
     return result;
 }
+bool observerResource(const unsigned char* object) {
+    if(!object || *(const int16_t*)(object+6)!=1) return false;
+    // Exact RTTI tables of RESOURCE_GOLD/STEEL/MANA in the supported builds.
+    auto table=*(void* const*)object;
+    return table==address(0xa3db54) || table==address(0xa3d9c4) || table==address(0xa3dce4);
+}
+bool observerInspectable(const unsigned char* object) {
+    if(!object || *(const int16_t*)(object+0x4c)!=0) return false;
+    int kind=*(const int16_t*)(object+6);
+    if(kind!=0 && kind!=1) return false;
+    if(observerResource(object)) return true; // Neutral resource HP can be zero.
+    int owner=*(const int16_t*)(object+8);
+    return owner>=0 && owner<8 && *(const uint16_t*)(object+0x14)>0;
+}
+void prepareObserverBuildingRing(unsigned char* object,SpriteFrame setFrame) {
+    auto sprite=*(unsigned char**)(object+0x84);int type=*(int16_t*)(object+4);
+    if(!sprite || type<0 || type>=116) return;
+    // 47872d..478770 normally prepares this during simulation selection.
+    // Observer selection deliberately never invokes that simulation function.
+    *(int16_t*)(sprite+0xc)=(int16_t)*(int*)(object+0x18);
+    *(int16_t*)(sprite+0xe)=(int16_t)*(int*)(object+0x1c);
+    int frame=at<int16_t>(0xb36338+type*2)+27+2*7; // Native +4f selection relation.
+    setFrame(sprite,frame,0);*(int*)(sprite+0x28)=1;
+}
+uint32_t observerObjectDisplay(void* self,Process original) {
+    if(!playback || !active || inDispatch || GetCurrentThreadId()!=producer) return original(self);
+    auto building=(unsigned char*)self;
+    unsigned char fog=building[0x6b],invisible=building[0x69],globalFog=at<unsigned char>(0xb3ba61);
+    bool isBuilding=*(int16_t*)(building+6)==1;
+    unsigned char buildingDraw=isBuilding?building[0x14d9]:0;
+    unsigned char selected=building[0x4e],enemySelected=building[0x4f];
+    bool observerChoice=observerSelected>=0 && observerUnit(observerSelected)==building &&
+        observerInspectable(building);
+
+    uint32_t result=0;
+    // Actual sprite callbacks run after preparation has restored detection.
+    // Building 47ad13 and character 494a08 -> 48ffe0 recheck these bytes.
+    __try {
+        building[0x6b]=0;building[0x69]=0;at<unsigned char>(0xb3ba61)=1;
+        // 494f61/47af36 gate native selection-ring sprites on +4e;
+        // enemy characters additionally require +4f at 494f82.
+        // Never invoke player selection or modify its command/selection arrays.
+        building[0x4e]=observerChoice?1:0;
+        building[0x4f]=observerChoice?1:0;
+
+        if(isBuilding) {
+            building[0x14d9]=1;
+            if(observerChoice) prepareObserverBuildingRing(building,(SpriteFrame)address(0x475930));
+            if(*(int16_t*)(building+0x14a6)!=0) observerConstructionDraws.fetch_add(1,std::memory_order_relaxed);
+        }
+        result=original(self);
+    } __finally {
+        building[0x6b]=fog;building[0x69]=invisible;at<unsigned char>(0xb3ba61)=globalFog;
+        building[0x4e]=selected;building[0x4f]=enemySelected;
+        if(isBuilding) building[0x14d9]=buildingDraw;
+    }
+    return result;
+}
+uint32_t __fastcall characterRenderHook(void* self,void*) {return observerObjectDisplay(self,characterRender);}
+uint32_t __fastcall buildingRenderHook(void* self,void*) {return observerObjectDisplay(self,buildingRender);}
 uint32_t __fastcall observerPanelHook(void* self,void*) {
     if(playback && active && !showObserverHud) return 0;
     auto original=(Process)(*(void***)self)[4];
@@ -322,7 +470,8 @@ uint32_t __fastcall observerPanelHook(void* self,void*) {
     }
     auto unit=observerUnit(observerSelected);
     int owner=unit?*(int16_t*)(unit+8):-1;
-    bool valid=unit && owner>=0 && owner<8 && *(int16_t*)(unit+0x4c)==0 && *(uint16_t*)(unit+0x14)>0;
+    bool valid=observerInspectable(unit);
+    bool playerOwned=valid && !observerResource(unit);
     int selected=valid?observerSelected:-1;
     memset(observerSelectionSlots,0xff,sizeof(observerSelectionSlots));
     observerSelectionSlots[0]=(int16_t)selected;
@@ -337,10 +486,12 @@ uint32_t __fastcall observerPanelHook(void* self,void*) {
         *(uint16_t*)(observerPanel+0x6ac)=0xffff;
     }
     uint32_t savedPlayer=*(uint32_t*)(game+0x664),result=0;
-    *(void**)(observerPanel+0x23c)=valid?((void**)(game+0x48))[owner]:*(void**)(ui+0x23c);
+    *(void**)(observerPanel+0x23c)=playerOwned?((void**)(game+0x48))[owner]:*(void**)(ui+0x23c);
     __try {
         observerPanelDrawing=true;
-        if(valid) *(uint32_t*)(game+0x664)=(uint32_t)owner;
+        // Neutral resources use the existing viewing player, as in normal play.
+        // Never index the eight participant slots with neutral owner 10.
+        if(playerOwned) *(uint32_t*)(game+0x664)=(uint32_t)owner;
         __try {result=original(observerPanel);}
         __except(observerPanelException(GetExceptionInformation())) {result=0;}
     } __finally {*(uint32_t*)(game+0x664)=savedPlayer;observerPanelDrawing=false;}
@@ -349,6 +500,26 @@ uint32_t __fastcall observerPanelHook(void* self,void*) {
 uint32_t __fastcall observerSelectionSync(void* self,void*,uint32_t writePlayerSelection) {
     using Sync=uint32_t(__thiscall*)(void*,uint32_t);
     return ((Sync)address(0x512a00))(self,observerPanelDrawing?0:writePlayerSelection);
+}
+uint32_t __fastcall observerMinimapBuildingVisible(unsigned char* building,void*) {
+    // Type +6==1 goes to 4b3372, independently of terrain/unit visibility.
+    // Native 4b3385 hides buildings whose remembered-visibility byte is zero.
+    if(playback && active && displayDepth && GetCurrentThreadId()==producer) return 1;
+    return building[0x14e8]!=0;
+}
+__declspec(naked) void observerMinimapBuildingFlags() {
+    __asm {
+        push eax
+        push ecx
+        push edx
+        mov ecx,edi
+        call observerMinimapBuildingVisible
+        test al,al
+        pop edx
+        pop ecx
+        pop eax
+        ret
+    }
 }
 uint32_t __fastcall observerLayerHook(void* self,void*) {
     auto original=(Process)(*(void***)self)[2];
@@ -363,7 +534,7 @@ uint32_t __fastcall observerLayerHook(void* self,void*) {
         auto source=*(unsigned char**)(map+0x3c);
         if(*(int*)(map+0x1c)<=0 || (map[0x9f] && (!source || !*(void**)(source+0x28)))) return original(self);
         unsigned char dirty=map[0xa2];uint32_t stamp=at<uint32_t>(0xb8a244),result=0;
-        __try {map[0xa2]=1;((Process)address(0x4b2fa0))(self);result=original(self);}
+        __try {map[0xa2]=1;observerDisplay(self,(Process)address(0x4b2fa0));result=original(self);}
         __finally {map[0xa2]=dirty;at<uint32_t>(0xb8a244)=stamp;}
         return result;
     }
@@ -399,9 +570,16 @@ uint32_t __stdcall playbackClock() {
     return clockValue;
 }
 
-struct ObserverPlayer {bool participant;int steel,gold,mana,population,capacity,farmers;};
+struct ObserverPlayer {bool participant;int steel,gold,mana,population,capacity,farmers;int race,color;};
 ObserverPlayer observerPlayers[8]{};
 PlayerNames savedNames{1,{}};
+bool loadRecordedNames(const unsigned char* data,uint32_t size) {
+    if(size!=sizeof(PlayerNames)) return false;
+    PlayerNames names{};memcpy(&names,data,sizeof(names));
+    if(names.version!=1) return false;
+    for(auto& name:names.names) if(!memchr(name,0,sizeof(name))) return false;
+    savedNames=names;return true;
+}
 bool copyPlayerName(const char* text,int length,char (&out)[64]) {
     __try {
         if(!text || length<1 || length>1024) return false;
@@ -472,22 +650,39 @@ unsigned char* observerUnit(int index) {
 }
 int observerTracked=-1;
 unsigned char* observerTrackedObject=nullptr;
-void stopObserverTracking() {observerTracked=-1;observerTrackedObject=nullptr;}
+bool observerCameraValid=false,observerCameraRelease=false;
+int observerCameraX=0,observerCameraY=0;
+void stopObserverTracking(bool hold=false) {
+    observerCameraRelease=hold && observerTracked>=0 && observerCameraValid;
+    observerTracked=-1;observerTrackedObject=nullptr;observerCameraValid=false;
+}
+void __fastcall observerCameraInputHook(void* self,void*) {
+    if(!playback || !active || inDispatch || GetCurrentThreadId()!=producer) {cameraInput(self);return;}
+    // 53cee0 derives an automatic camera target from the recorded player's
+    // +170c/+1710 selection. Leave manual edge/keyboard scrolling intact.
+    auto count=(int16_t*)((unsigned char*)self+0x170c);int16_t saved=*count;
+    __try {*count=0;cameraInput(self);}
+    __finally {*count=saved;}
+}
 bool liveObserverUnit(const unsigned char* unit) {
     return unit && *(const int16_t*)(unit+0x4c)==0 && *(const uint16_t*)(unit+0x14)>0;
 }
 void toggleObserverTracking() {
+    // Ctrl+C is a stop operation while tracking, even if the observer has
+    // since selected another unit. Never retarget as a side effect of release.
+    if(observerTracked>=0) {stopObserverTracking(true);return;}
     auto unit=observerUnit(observerSelected);
-    if(!liveObserverUnit(unit) || (observerTracked==observerSelected && observerTrackedObject==unit)) {
+    if(!liveObserverUnit(unit)) {
         stopObserverTracking();return;
     }
     observerTracked=observerSelected;observerTrackedObject=unit;
+    observerCameraValid=false;observerCameraRelease=false;
 
 }
 void updateObserverTracking(void* self) {
     if(!playback || !active || observerTracked<0) return;
     auto unit=observerUnit(observerTracked);
-    if(unit!=observerTrackedObject || !liveObserverUnit(unit)) {stopObserverTracking();return;}
+    if(unit!=observerTrackedObject || !liveObserverUnit(unit)) {stopObserverTracking(true);return;}
     auto game=(unsigned char*)self;
     int width=showObserverHud?at<int>(0xbf2588):at<int>(0xbf2578)-at<int>(0xbf2580);
     int height=at<int>(0xbf258c);
@@ -500,9 +695,12 @@ void updateObserverTracking(void* self) {
     at<int>(0xb869c8)=std::max(128,std::min(maximumY,*(int*)(unit+0x1c)-height/2));
 }
 void synchronizeObserverCamera(void* self) {
-    if(!playback || !active || observerTracked<0) return;
-    updateObserverTracking(self);
-    if(observerTracked<0) return;
+    if(!playback || !active || (observerTracked<0 && !observerCameraRelease)) return;
+    if(observerTracked>=0) updateObserverTracking(self);
+    if(observerTracked<0 && !observerCameraRelease) return;
+    if(observerCameraRelease) {
+        at<int>(0xb869c4)=observerCameraX;at<int>(0xb869c8)=observerCameraY;
+    }
     auto renderer=(unsigned char*)at<void*>(0xb86f14);
     if(!renderer) return;
     auto holder=*(unsigned char***)(renderer+0x38);
@@ -517,6 +715,13 @@ void synchronizeObserverCamera(void* self) {
     ((Region)address(0x630930))(address(0xbea698),x,y,-1,-1);
     auto game=(unsigned char*)self;
     *(int*)(game+0x9c4)=x;*(int*)(game+0x9c8)=y;
+    observerCameraX=x;observerCameraY=y;observerCameraValid=observerTracked>=0;
+    observerCameraRelease=false;
+}
+bool liveObserverWorker(const unsigned char* unit) {
+    int type=*(const int16_t*)(unit+4);
+    return (type==0 || type==15) && *(const int16_t*)(unit+6)==0 &&
+        *(const int16_t*)(unit+0x4c)==0 && *(const uint16_t*)(unit+0x14)>0;
 }
 void refreshObserver(void* self) {
     if(at<uint32_t>(0xb8a280)-observerRefreshAt<8 && observerRefreshAt) return;
@@ -527,6 +732,7 @@ void refreshObserver(void* self) {
         auto& row=observerPlayers[i];row={};
         if(!player || !player[0xc] || *(uint32_t*)(player+8)==3000 || *(uint32_t*)(player+8)==0xffffffff) continue;
         row.participant=true;
+        row.race=*(int*)(player+8);row.color=*(int*)(player+0x5c0);
         row.steel=*(int*)(player+0xa08);row.gold=*(int*)(player+0xa0c);row.mana=*(int*)(player+0xa10);
         row.population=*(int*)(player+0xe24);
         using Capacity=int(__thiscall*)(void*);
@@ -539,9 +745,8 @@ void refreshObserver(void* self) {
     for(uint32_t i=0;i<count && index<11264;++i) {
         auto unit=observerUnit((int)index);
         if(unit) {
-            int owner=*(int16_t*)(unit+8),type=*(int16_t*)(unit+4);
-            if(owner>=0 && owner<8 && observerPlayers[owner].participant && (type==0 || type==15) &&
-               *(int16_t*)(unit+6)==0 && *(int16_t*)(unit+0x4c)==0 && *(uint16_t*)(unit+0x14)>0 && !unit[0x67]) ++observerPlayers[owner].farmers;
+            int owner=*(int16_t*)(unit+8);
+            if(owner>=0 && owner<8 && observerPlayers[owner].participant && liveObserverWorker(unit)) ++observerPlayers[owner].farmers;
         }
         index=*(uint32_t*)(manager+0xdc4c+index*12);
     }
@@ -562,6 +767,117 @@ unsigned observerDisplayName(const char* name,char* output) {
     if(name[end]) {output[end++]='.';output[end++]='.';output[end]=0;}
     return end;
 }
+char observerRaceInitial(int race) {return race==1000?'H':race==2000?'D':'?';}
+uint16_t observerPlayerColor(int color) {
+    if(color<0 || color>9) return at<int>(0xbf281c)==0x8000?0x7fff:0xffff;
+    // Same 555/565 player palette used by minimap 4b3216/4b3228.
+    return at<uint16_t>((at<int>(0xbf281c)==0x8000?0xbea770:0xbea784)+color*2);
+}
+void observerColoredName(const char* name,int color,char (&output)[64]) {
+    char visible[20];observerDisplayName(name,visible);
+    // Private queued-ID marker, consumed by observerTextDrawHook before parsing.
+    // Native \cHHHH is a FONT PALETTE INDEX, never a raw RGB value.
+    sprintf_s(output,"\\c%04X",observerPlayerColor(color));unsigned end=6;
+    for(unsigned i=0;visible[i];) {
+        unsigned width=IsDBCSLeadByteEx(949,(BYTE)visible[i])?2:1;
+        if(width==1 && visible[i]=='\\') output[end++]='\\';
+        for(unsigned j=0;j<width && visible[i];++j) output[end++]=visible[i++];
+    }
+    output[end]=0;
+}
+// 54a665 indexes a 64-byte font palette with the parsed color value.
+// Queueing a color is insufficient: native font+40 can override that palette.
+// Scope the override to the actual draw of our exact queued participant ID.
+bool observerExtraColor(const char* text,uint16_t& color);
+bool observerIdText(const char* text,uint16_t& color) {
+    if(!text || text[0]!='\\' || text[1]!='c' || !playback || !active || inDispatch || GetCurrentThreadId()!=producer) return false;
+    if(observerExtraColor(text,color)) return true;
+    for(unsigned i=0;i<8;++i) if(observerPlayers[i].participant) {
+        char fallback[16],expected[64];
+        observerColoredName(observerName(i,fallback),observerPlayers[i].color,expected);
+        if(!strcmp(text,expected)) {color=observerPlayerColor(observerPlayers[i].color);return true;}
+    }
+    return false;
+}
+uint16_t observerTint(uint16_t shade,uint16_t color,bool rgb555) {
+    unsigned shift=rgb555?10:11,greenMask=rgb555?31:63;
+    unsigned r=(shade>>shift)&31,g=(shade>>5)&greenMask,b=shade&31;
+    unsigned brightness=std::max(std::max(r*255/31,g*255/greenMask),b*255/31);
+    return (uint16_t)(((((color>>shift)&31)*brightness/255)<<shift) |
+                     ((((color>>5)&greenMask)*brightness/255)<<5) |
+                     ((color&31)*brightness/255));
+}
+bool tintObserverGlyph(const uint16_t* source,int height,uint16_t color,bool rgb555,std::vector<uint16_t>& tinted) {
+    if(!source || height<=0 || height>128) return false;
+    tinted.clear();
+    for(int y=0;y<height;++y) {
+        unsigned length=source[0];
+        if(length<2 || length>2048 || tinted.size()+length>32768) return false;
+        size_t start=tinted.size();tinted.insert(tinted.end(),source,source+length);
+        unsigned pos=1;
+        while(pos<length && source[pos]!=0xffff) {
+            uint16_t command=source[pos++];
+            unsigned count=(command>>8)&0x7f;
+            // Native 638750: transparent and repeated runs contain one value;
+            // literal runs contain count 16-bit pixels. Alpha/header stay intact.
+            unsigned values=(!(command&0xff) || (command&0x8000))?1:count;
+            if(pos+values>length) return false;
+            if(command&0xff) for(unsigned n=0;n<values;++n)
+                tinted[start+pos+n]=observerTint(source[pos+n],color,rgb555);
+            pos+=values;
+        }
+        if(pos>=length || source[pos]!=0xffff) return false;
+        source+=length;
+    }
+    return true;
+}
+uint32_t __cdecl observerGlyphDraw(const uint16_t* source,int width,int height,int skipX,int skipY,void* pixels,int pitch) {
+    if(observerIdTintDepth && GetCurrentThreadId()==producer) {
+        std::vector<uint16_t> tinted;
+        if(tintObserverGlyph(source,height,observerIdTintColor,at<int>(0xbf281c)==0x8000,tinted)) {
+            observerIdGlyphs.fetch_add(1,std::memory_order_relaxed);
+            return glyphDraw(tinted.data(),width,height,skipX,skipY,pixels,pitch);
+        }
+        observerIdGlyphFailures.fetch_add(1,std::memory_order_relaxed);
+    }
+    return glyphDraw(source,width,height,skipX,skipY,pixels,pitch);
+}
+uint32_t __fastcall observerTextDrawHook(void* self,void*,const char* text,void* pixels,int x,int pitch,int height,int translate) {
+    uint16_t color;
+    if(!observerIdText(text,color)) return textDraw(self,text,pixels,x,pitch,height,translate);
+    auto font=(unsigned char*)self;
+    int face=*(int*)(font+0x84);
+    if(face<0 || face>=10) return textDraw(self,text+6,pixels,x,pitch,height,translate);
+    bool indexed=at<int>(0xb40d64+face*4)==1;
+    auto assets=*(unsigned char**)font;
+    auto palette=indexed?*(uint16_t**)(assets+0xf0+face*4):nullptr;
+    uint32_t savedOverride=*(uint32_t*)(font+0x40);
+    uint16_t savedPalette[32];memcpy(savedPalette,font+0x44,sizeof(savedPalette));
+    bool rgb555=at<int>(0xbf281c)==0x8000;
+    uint32_t result=0;
+    unsigned savedDepth=observerIdTintDepth;uint16_t savedColor=observerIdTintColor;
+    __try {
+        observerIdTintDepth=savedDepth+1;observerIdTintColor=color;
+        observerIdPaints.fetch_add(1,std::memory_order_relaxed);
+        // Use the current override's shading if active, otherwise native palette 0.
+        auto source=savedOverride?savedPalette:palette;
+        if(indexed) {
+            for(unsigned i=0;i<32;++i) ((uint16_t*)(font+0x44))[i]=observerTint(source[i],color,rgb555);
+        } else {
+            // GDI glyph path 54a8d2 reads this exact foreground slot even
+            // for face 4 (whose bitmap fallback uses direct RGB pixels).
+            ((uint16_t*)(font+0x44))[1]=color;
+        }
+        *(uint32_t*)(font+0x40)=1;
+        result=textDraw(self,text+6,pixels,x,pitch,height,translate);
+    } __finally {
+        memcpy(font+0x44,savedPalette,sizeof(savedPalette));*(uint32_t*)(font+0x40)=savedOverride;
+        observerIdTintDepth=savedDepth;observerIdTintColor=savedColor;
+    }
+    return result;
+}
+#include "observer_overlays.h"
+
 int observerIdColumnWidth() {
     unsigned longest=2;
     for(unsigned i=0;i<8;++i) if(observerPlayers[i].participant) {
@@ -573,8 +889,9 @@ int observerIdColumnWidth() {
 }
 uint32_t __fastcall interfaceHook(void* self,void*) {
     uint32_t result=interfaceRender(self);
-    if(!active || !playback) return result;
+    if(!active || !playback || playbackResultsStarted) return result;
     refreshObserver(self);
+    drawObserverExtras(self);
     char line[256]{};
     if(showObserverHud && showReplayTime) {
         // The renderer's native dimensions are used; no recorded-resolution coordinates.
@@ -586,20 +903,21 @@ uint32_t __fastcall interfaceHook(void* self,void*) {
     }
     if(showResources) {
         const int idWidth=observerIdColumnWidth();
-        const int columns[]={0,idWidth,idWidth+55,idWidth+105,idWidth+150,idWidth+215};
-        const char* labels[]={"ID","Gold","Steel","Mana","Pop","Farm"};
-        int x=std::max(12,at<int>(0xbf2588)-(idWidth+275));
-        for(unsigned c=0;c<6;++c) observerText(self,x+columns[c],28,labels[c]);
+        const int columns[]={0,idWidth,idWidth+28,idWidth+83,idWidth+133,idWidth+178,idWidth+243};
+        const char* labels[]={"ID","R","Gold","Steel","Mana","Pop","Workers"};
+        int x=std::max(12,at<int>(0xbf2588)-(idWidth+323));
+        for(unsigned c=0;c<7;++c) observerText(self,x+columns[c],28,labels[c]);
         int y=46;
         for(unsigned i=0;i<8;++i) if(observerPlayers[i].participant) {
             auto& row=observerPlayers[i];
             char fallback[16];const char* name=observerName(i,fallback);
-            observerDisplayName(name,line);
-            observerText(self,x+columns[0],y,line);
+            char colored[64];observerColoredName(name,row.color,colored);
+            observerText(self,x+columns[0],y,colored);
+            char race[]={observerRaceInitial(row.race),0};observerText(self,x+columns[1],y,race);
             int values[]={row.gold,row.steel,row.mana,row.population,row.farmers};
-            for(unsigned c=1;c<6;++c) {
-                if(c==4) sprintf_s(line,"%d/%d",row.population,row.capacity);
-                else sprintf_s(line,"%d",values[c-1]);
+            for(unsigned c=2;c<7;++c) {
+                if(c==5) sprintf_s(line,"%d/%d",row.population,row.capacity);
+                else sprintf_s(line,"%d",values[c-2]);
                 observerText(self,x+columns[c],y,line);
             }
             y+=17;
@@ -622,7 +940,7 @@ bool selectObserverUnit(int x,int y) {
     observerSelected=-1;int distance=0x7fffffff;
     for(uint32_t i=0;i<count && index<11264;++i) {
         auto unit=observerUnit((int)index);
-        if(unit && *(int16_t*)(unit+0x4c)==0 && *(uint16_t*)(unit+0x14)>0) {
+        if(observerInspectable(unit)) {
             int dx=*(int*)(unit+0x18)-x,dy=*(int*)(unit+0x1c)-y;
             int radius=*(int16_t*)(unit+6)?80:40;
             if(abs(dx)<=radius && abs(dy)<=radius) {
@@ -818,9 +1136,23 @@ void restore();
 void showPlaybackNotice();
 void confirmPlaybackExit(HWND window);
 
+bool beginReplayResults(void* application,ChangeState changeState) {
+    if(!playback || !terminal.load() || failed.load() || notice.load()!=10) return false;
+    if(playbackResultsStarted) return true;
+    // State 16 (5978d4) is the native custom-match result entry; it creates
+    // CGameResultMenu via CGame vtable+6c, then advances to result state 17.
+    // This runs on the next application frame, after command/queue scopes unwind.
+    playbackResultsStarted=true;
+    resetObserverExtras();
+    stopObserverTracking();
+    changeState(application,16);
+    log("RS01 verified replay end; opening native game results.");
+    return true;
+}
 uint32_t __fastcall applicationHook(void* self,void*) {
     if(playback && (exitConfirmationOpen || playbackExitRequested)) return 1;
     if(playback && terminal.load()) {
+        if(beginReplayResults(self,(ChangeState)address(0x598820))) return applicationProcess(self);
         showPlaybackNotice();return 1;
     }
     // 19 is the initialized main menu, measured in this exact Steam build.
@@ -899,16 +1231,18 @@ LRESULT CALLBACK recordingWindowProc(HWND window,UINT message,WPARAM wparam,LPAR
         if(message==WM_KEYDOWN && !(lparam&(1L<<30))) showReplayTime=!showReplayTime;
         return 0;
     }
-    if(playback && active && (wparam=='t' || wparam=='T') && (message==WM_CHAR || message==WM_SYSCHAR)) return 0;
-    if(playback && active && message==WM_KEYUP && (wparam=='I' || wparam=='U' || wparam=='1' || wparam=='2' || wparam=='4')) return 0;
+    if(playback && active && (wparam=='t' || wparam=='T' || wparam=='h' || wparam=='H') && (message==WM_CHAR || message==WM_SYSCHAR)) return 0;
+    if(playback && active && message==WM_KEYUP && (wparam=='I' || wparam=='U' || wparam=='H' || wparam=='1' || wparam=='2' || wparam=='4')) return 0;
     if(playback && active && message==WM_KEYDOWN && !(lparam&(1L<<30))) {
+        if(wparam=='H') {showHeroPanel=!showHeroPanel;return 0;}
         if(wparam=='I') {showResources=!showResources;return 0;}
         if(wparam=='U') {toggleObserverHud();return 0;}
         if(wparam=='1' || wparam=='2' || wparam=='4') {
             playbackClock();replaySpeed=(unsigned)(wparam-'0');return 0;
         }
     }
-    if(playback && active && message==WM_LBUTTONDOWN) {
+    if(playback && active && !terminal.load() && message==WM_LBUTTONDOWN) {
+        if(clickObserverHeroClient((int16_t)LOWORD(lparam),(int16_t)HIWORD(lparam))) return 0;
         if(selectObserverUnit((int16_t)LOWORD(lparam),(int16_t)HIWORD(lparam))) return 0;
     }
     if(message==RecordPulse) {
@@ -965,6 +1299,25 @@ uint32_t __fastcall commandHook(void* self,void*,uint32_t length,const void* byt
             CommandHeader h{at<uint32_t>(0xb8a280),at<uint32_t>(0xbed1e8),at<uint32_t>(0xb827dc),length};
             memcpy(buffer,&h,sizeof(h));memcpy(buffer+sizeof(h),bytes,length);
             emit(Command,buffer,sizeof(h)+length);
+            const uint32_t ordinal=populationOrdinal++;
+            const uint16_t opcode=*(const uint16_t*)bytes;
+            if(populationSamples<1500 && h.tick>=initial.state.tick &&
+               (uint64_t)(h.tick-initial.state.tick)*(hasCapturedBootstrap?capturedBootstrap.tickInterval:30)<=300000 &&
+               ((length==8 && (opcode==400 || opcode==401 || opcode==500)) ||
+                (length==12 && (opcode==170 || opcode==5170)))) {
+                const uint16_t owner=((const uint16_t*)bytes)[1];
+                if(owner<8) {
+                    auto player=((unsigned char**)((unsigned char*)self+48))[owner];
+                    if(player) {
+                        int used=*(int*)(player+0xe24);
+                        int capacity=((int(__thiscall*)(void*))address(0x522760))(player);
+                        if(used>=0 && used<=1000000 && capacity>=0 && capacity<=1000000) {
+                            PopulationSample sample{ordinal,h.tick,owner,(uint32_t)used,(uint32_t)capacity};
+                            emit(Population,&sample,sizeof(sample));++populationSamples;
+                        }
+                    }
+                }
+            }
         }
     }
     uint32_t result=apply(self,length,bytes);
@@ -1075,12 +1428,14 @@ uint32_t __fastcall advanceHook(void* self,void*,uint32_t a,uint32_t b) {
                 }
                 invalidate(7);return 1;
             }
-            if(nextKind(Names) && (!getRecord(Names,p,n) || n!=sizeof(PlayerNames))) {invalidate(6);return 1;}
+            // Reapply at match start, after native menu/map initialization;
+            // do not merely consume and discard this display metadata.
+            if(nextKind(Names) && (!getRecord(Names,p,n) || !loadRecordedNames(p,n))) {invalidate(6);return 1;}
             if(nextKind(Setup) && (!getRecord(Setup,p,n) || (n!=84 && n!=sizeof(MatchSetup)))) {invalidate(6);return 1;}
             if(nextKind(Bootstrap) && (!getRecord(Bootstrap,p,n) || n!=sizeof(NetworkBootstrap))) {invalidate(6);return 1;}
         } else {
             MatchSetup setup{};captureSetup(self,setup);
-            bootstrapEmitted=false;
+            bootstrapEmitted=false;populationOrdinal=0;populationSamples=0;
             emit(Begin,&initial,sizeof(initial));
             PlayerNames names{};captureNames(self,names);emit(Names,&names,sizeof(names));
             // Custom-menu globals do not describe the multiplayer lobby.
@@ -1136,6 +1491,16 @@ uint32_t __fastcall destroyHook(void* self,void*,uint32_t flags) {
     return destroy(self,flags);
 }
 
+uint32_t __fastcall resultButtonHook(void* self,void*,uint32_t button) {
+    if(playback && playbackResultsStarted && !failed.load() && button==704) {
+        // The native button returns to a multiplayer lobby (597a48), absent in
+        // offline replay. Exit the process message loop instead, after this event.
+        playbackExitRequested=true;stopObserverTracking();
+        log("RS02 result confirm: exiting replay process without returning to network lobby.");
+        restore();PostQuitMessage(0);return 1;
+    }
+    return resultButton(self,button);
+}
 uint32_t __fastcall resultRenderHook(void* self,void*) {
     // CGameResultMenu's third virtual method draws the completed-match screen.
     // Unlike map-directory changes this also covers maps retained on results.
@@ -1213,7 +1578,9 @@ uint32_t __fastcall replayQueueTick(void*,void*,uint32_t) {return at<uint32_t>(0
 uint32_t __fastcall processHook(void* self,void*) {
     if(playback && (exitConfirmationOpen || playbackExitRequested)) return 1;
     if(playback && terminal.load()) {
-        showPlaybackNotice();
+        // A successful End waits for applicationHook to open the result UI.
+        // Do not show the old exit modal if CGame ticks first in this frame.
+        if(failed.load() || notice.load()!=10) showPlaybackNotice();
         return 1;
     }
     observerAudioTick.store(at<uint32_t>(0xb8a280),std::memory_order_relaxed);
@@ -1341,10 +1708,7 @@ bool readInput(const wchar_t* path) {
         memcpy(&savedInitial,p,size);
         savedNames={1,{}};
         if(nextKind(Names)) {
-            if(!getRecord(Names,p,size) || size!=sizeof(savedNames)) return false;
-            memcpy(&savedNames,p,size);
-            if(savedNames.version!=1) return false;
-            for(auto& name:savedNames.names) if(!memchr(name,0,sizeof(name))) return false;
+            if(!getRecord(Names,p,size) || !loadRecordedNames(p,size)) return false;
         }
         if(nextKind(Setup)) {
             if(!getRecord(Setup,p,size) || (size!=84 && size!=sizeof(savedSetup))) return false;
@@ -1401,6 +1765,9 @@ DWORD WINAPI worker(void* argument) {
     if(ok && playback) {
         if(argument) ok=readInput(config.input);
         else {GetEnvironmentVariableW(L"KUF_REPLAY_INPUT",buffer,32768);ok=readInput(buffer);}
+        if(ok) for(unsigned i=0;i<8;++i) {
+            char line[144];sprintf_s(line,"NM01 recorded-name slot=%u name=%s",i+1,savedNames.names[i][0]?savedNames.names[i]:"<missing>");log(line);
+        }
     }
     ring=(unsigned char*)VirtualAlloc(nullptr,RingSize,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
     ok=ok && ring;
@@ -1441,6 +1808,8 @@ DWORD WINAPI worker(void* argument) {
         if(ok) {process=reinterpret_cast<Process>(patchEntry(0x4cf2b0,procPrefix,sizeof(procPrefix),(void*)processHook));ok=process!=nullptr;}
         if(ok) {destroy=reinterpret_cast<Destroy>(patchEntry(0x4c09f0,destroyPrefix,sizeof(destroyPrefix),(void*)destroyHook));ok=destroy!=nullptr;}
         if(ok) {resultRender=reinterpret_cast<Process>(patchEntry(0x7245d0,procPrefix,sizeof(procPrefix),(void*)resultRenderHook));ok=resultRender!=nullptr;}
+        const unsigned char resultButtonPrefix[]={0x55,0x8b,0xec,0x6a,0xff};
+        if(ok && playback) {resultButton=(ResultButton)patchEntry(0x7241e0,resultButtonPrefix,sizeof(resultButtonPrefix),(void*)resultButtonHook);ok=resultButton!=nullptr;}
         if(ok && playback) {applicationProcess=reinterpret_cast<Process>(address(0x593f80));ok=patchCall(0x4fee4b,0x593f80,(void*)applicationHook);}
         if(ok && playback) {
             // Offline loading has no peer start timestamp (+9f0/+9f4). Skip only
@@ -1456,8 +1825,32 @@ DWORD WINAPI worker(void* argument) {
             if(ok) {prepareDisplay=reinterpret_cast<Process>(patchEntry(0x4c6a70,renderPrefix,sizeof(renderPrefix),(void*)prepareDisplayHook));ok=prepareDisplay!=nullptr;}
             const unsigned char drawPrefix[]={0x55,0x8b,0xec,0x83,0xec,0x54};
             if(ok) {drawDisplay=reinterpret_cast<Process>(patchEntry(0x4ced30,drawPrefix,sizeof(drawPrefix),(void*)drawDisplayHook));ok=drawDisplay!=nullptr;}
+            // 478440 is visual body preparation, not the simulation update 47aa30.
+            const unsigned char bodyPrefix[]={0x55,0x8b,0xec,0x51,0x56,0x8b,0xf1};
+            if(ok) {ok=!memcmp(address(0x478440),bodyPrefix,sizeof(bodyPrefix));if(ok) buildingBodyPrepare=(Process)address(0x478440);}
+            const unsigned char researchPrefix[]={0x56,0x8b,0xf1,0x0f,0xbf,0x86,0x88,0x14,0,0};
+            if(ok) {researchProgress=(Process)patchEntry(0x47c590,researchPrefix,sizeof(researchPrefix),(void*)researchProgressHook);ok=researchProgress!=nullptr;}
+            const unsigned char cameraPrefix[]={0x55,0x8b,0xec,0x83,0xec,0x30};
+            if(ok) {cameraInput=(CameraInput)patchEntry(0x53cee0,cameraPrefix,sizeof(cameraPrefix),(void*)observerCameraInputHook);ok=cameraInput!=nullptr;}
+            const unsigned char buildingPrefix[]={0x55,0x8b,0xec,0x83,0xec,0x0c};
+            if(ok) {buildingRender=(Process)patchEntry(0x47ad00,buildingPrefix,sizeof(buildingPrefix),(void*)buildingRenderHook);ok=buildingRender!=nullptr;}
+            const unsigned char characterPrefix[]={0x55,0x8b,0xec,0x83,0xec,0x64};
+            if(ok) {characterRender=(Process)patchEntry(0x4949f0,characterPrefix,sizeof(characterPrefix),(void*)characterRenderHook);ok=characterRender!=nullptr;}
+            if(ok) {glyphDraw=(GlyphDraw)address(0x638750);ok=patchCall(0x54a72a,0x638750,(void*)observerGlyphDraw);}
+            const unsigned char textDrawPrefix[]={0x55,0x8b,0xec,0x6a,0xff};
+            if(ok) {textDraw=(TextDraw)patchEntry(0x54a000,textDrawPrefix,sizeof(textDrawPrefix),(void*)observerTextDrawHook);ok=textDraw!=nullptr;}
             if(ok) {interfaceRender=(Process)address(0x4d5f00);ok=patchCall(0x4c6b78,0x4d5f00,(void*)interfaceHook);}
             if(ok) ok=patchCall(0x5056d5,0x512a00,(void*)observerSelectionSync);
+            if(ok) {
+                minimapAlarmBlit=(MinimapAlarmBlit)address(0x4b1e60);
+                ok=patchCall(0x4b46b6,0x4b1e60,(void*)replayMinimapAlarmBlit);
+            }
+            const unsigned char minimapBuildingCompare[]={0x80,0xbf,0xe8,0x14,0,0,0};
+            if(ok && !memcmp(address(0x4b3385),minimapBuildingCompare,sizeof(minimapBuildingCompare))) {
+                std::vector<unsigned char> bytes(7,0x90);bytes[0]=0xe8;
+                int32_t delta=(int32_t)((uintptr_t)observerMinimapBuildingFlags-(uintptr_t)address(0x4b3385)-5);
+                memcpy(bytes.data()+1,&delta,4);ok=change((unsigned char*)address(0x4b3385),bytes);
+            } else ok=false;
             // Report 261013-015445: 5f7703 dereferences a null internal file handle
             // from audio loader 5400df. Native 5f7710 is the same query with a null check.
             const unsigned char fileQueryPrefix[]={0x8b,0x49,0x04,0x8b,0x01};
@@ -1469,6 +1862,7 @@ DWORD WINAPI worker(void* argument) {
             const unsigned char audioPrefix[]={0x55,0x8b,0xec,0x83,0xe4,0xf8};
             if(ok) {spatialAudio=(Audio)patchEntry(0x540e70,audioPrefix,sizeof(audioPrefix),(void*)spatialAudioHook);ok=spatialAudio!=nullptr;}
             if(ok) {spatialLoopAudio=(Audio)patchEntry(0x5410a0,audioPrefix,sizeof(audioPrefix),(void*)spatialLoopAudioHook);ok=spatialLoopAudio!=nullptr;}
+            if(ok) {spatialUpdate=(Process)patchEntry(0x540c10,audioPrefix,sizeof(audioPrefix),(void*)spatialUpdateHook);ok=spatialUpdate!=nullptr;}
             if(ok) ok=patchCall(0x540eb0,0x4369f0,(void*)observerAudioVisibility);
             if(ok) ok=patchCall(0x5410e0,0x4369f0,(void*)observerAudioVisibility);
             // These calls pass speech resource archive b8a1e4; FX uses b8a1e0.
@@ -1519,6 +1913,7 @@ DWORD WINAPI worker(void* argument) {
     HANDLE event=OpenEventW(EVENT_MODIFY_STATE,FALSE,buffer);if(event) {SetEvent(event);CloseHandle(event);}
     if(!ok) return 1;
     log(playback?"Playback adapter ready. Automatic single-player/network bootstrap and spectator display enabled.":"Recording adapter ready. Single-player and multiplayer capture with network bootstrap enabled.");
+    HANDLE populationFile=INVALID_HANDLE_VALUE;
     HANDLE file=INVALID_HANDLE_VALUE;std::wstring partial;uint32_t fileBytes=0,number=0;
     uint32_t lastFrameOffset=0,writtenFrames=0;State writerBefore{};
     ULONGLONG checkAt=GetTickCount64(),pulseAt=0;int lastNotice=0;
@@ -1538,14 +1933,18 @@ DWORD WINAPI worker(void* argument) {
         if(playback) {
             static ULONGLONG audioLogAt=0;
             if(GetTickCount64()-audioLogAt>=10000) {
-                audioLogAt=GetTickCount64();char line[256];
-                sprintf_s(line,"AU01 audio tick=%u calls=%u onscreen=%u rejected=%u disabled=%u camera-aligned=%u death-events=%u death-submitted=%u",observerAudioTick.load(),observerAudioCalls.load(),observerAudioOnscreen.load(),observerAudioRejected.load(),observerAudioDisabled.load(),observerAudioCameraFixes.load(),observerDeathEvents.load(),observerDeathSubmitted.load());
+                audioLogAt=GetTickCount64();char line[512];
+                sprintf_s(line,"AU01 audio tick=%u calls=%u onscreen=%u rejected=%u disabled=%u camera-aligned=%u death-events=%u death-submitted=%u death-accepted=%u death-rejected=%u death-onscreen=%u last-death=%u",observerAudioTick.load(),observerAudioCalls.load(),observerAudioOnscreen.load(),observerAudioRejected.load(),observerAudioDisabled.load(),observerAudioCameraFixes.load(),observerDeathEvents.load(),observerDeathSubmitted.load(),observerDeathAccepted.load(),observerDeathRejected.load(),observerDeathOnscreen.load(),observerLastDeath.load());
                 log(line);
+                sprintf_s(line,"ID01 participant-name paints=%u bitmap-glyphs=%u tint-fallbacks=%u",observerIdPaints.load(),observerIdGlyphs.load(),observerIdGlyphFailures.load());log(line);
+                sprintf_s(line,"BD01 observer building-body-prepares=%u construction-draws=%u",observerBuildingBodies.load(),observerConstructionDraws.load());log(line);
+                sprintf_s(line,"OV01 hero-count=%u upgrade-warning=%u upgrade-complete=%u",observerHeroCount,observerUpgradeWarnings.load(),observerUpgradeCompletions.load());log(line);
             }
         }
         uint32_t t=tail.load(std::memory_order_relaxed),h=head.load(std::memory_order_acquire);
         if(windowDestroyed.load(std::memory_order_acquire) && t==h) {
             if(file!=INVALID_HANDLE_VALUE) {FlushFileBuffers(file);CloseHandle(file);}
+            if(populationFile!=INVALID_HANDLE_VALUE) {FlushFileBuffers(populationFile);CloseHandle(populationFile);}
             log("Game window destroyed; engine worker stopped.");
             return 0;
         }
@@ -1566,11 +1965,23 @@ DWORD WINAPI worker(void* argument) {
                     log(captured.networkMode==1?"Multiplayer match capture started: native synchronized command application order.":"Single-player match capture started.");
                 }
                 if(file!=INVALID_HANDLE_VALUE) CloseHandle(file);
+                if(populationFile!=INVALID_HANDLE_VALUE) CloseHandle(populationFile);
                 partial=inbox+L"\\"+std::to_wstring(GetCurrentProcessId())+L"_"+std::to_wstring(++number)+L".partial";
                 file=CreateFileW(partial.c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+                populationFile=CreateFileW((partial+L".population").c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+                if(populationFile!=INVALID_HANDLE_VALUE && (!WriteFile(populationFile,"KUFPOP01",8,&n,nullptr) || n!=8)) {
+                    CloseHandle(populationFile);populationFile=INVALID_HANDLE_VALUE;log("PO01 population metadata unavailable.");
+                }
                 fileBytes=8;
                 lastFrameOffset=0;writtenFrames=0;
                 if(file==INVALID_HANDLE_VALUE || !WriteFile(file,Magic,8,&n,nullptr) || n!=8) invalidate(11);
+            }
+            if(record.kind==Population) {
+                if(populationFile!=INVALID_HANDLE_VALUE && record.size==sizeof(PopulationSample) &&
+                   (!WriteFile(populationFile,payload,record.size,&n,nullptr) || n!=record.size)) {
+                    CloseHandle(populationFile);populationFile=INVALID_HANDLE_VALUE;log("PO01 population metadata write failed.");
+                }
+                tail.store(t+sizeof(record)+record.size,std::memory_order_release);continue;
             }
             if(file!=INVALID_HANDLE_VALUE && !failed.load()) {
                 if(record.kind==Before && record.size==sizeof(State)) {
@@ -1593,6 +2004,7 @@ DWORD WINAPI worker(void* argument) {
                 if(fileBytes>MaxFile || !WriteFile(file,&record,sizeof(record),&n,nullptr) || n!=sizeof(record) ||
                    !WriteFile(file,payload,record.size,&n,nullptr) || n!=record.size) invalidate(11);
                 if(record.kind==End && !failed.load()) {
+                    if(populationFile!=INVALID_HANDLE_VALUE) {FlushFileBuffers(populationFile);CloseHandle(populationFile);populationFile=INVALID_HANDLE_VALUE;}
                     if(!FlushFileBuffers(file)) invalidate(11);
                     CloseHandle(file);file=INVALID_HANDLE_VALUE;
                     if(!failed.load() && !MoveFileW(partial.c_str(),(partial+L".complete").c_str())) invalidate(11);
@@ -1607,6 +2019,7 @@ DWORD WINAPI worker(void* argument) {
         if(issue!=lastNotice) {char line[100];wsprintfA(line,"Engine status code: %d (see docs/ENGINE_NATIVE.md)",issue);log(line);if(playback && issue==10){wsprintfA(line,"Observer spatial audio callbacks: %u",observerAudioCalls.load());log(line);}lastNotice=issue;}
         if(GetTickCount64()-checkAt>2000 && !terminal.load()) {
             checkAt=GetTickCount64();
+            if(populationFile!=INVALID_HANDLE_VALUE) FlushFileBuffers(populationFile);
             if(file!=INVALID_HANDLE_VALUE && !failed.load() && !FlushFileBuffers(file)) invalidate(11);
             AcquireSRWLockShared(&codeLock);
             bool valid=!memcmp(expectedText.data(),(void*)textBase,textSize);

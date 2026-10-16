@@ -256,6 +256,30 @@ Python 테스트 25개 및 C++ 콜백 시험 통과: 상태 해제 후 종료, �
 - `GB01` 거부 메시지는 실제 경로/해시를 표시합니다. 실행 전과 오류 보고서 생성 시 `Errors/game-build.json`에 크기/해시/PE 식별 정보를 저장하고 제보 폴더에 포함합니다. EXE 자체나 비밀 키는 포함하지 않습니다.
 - 새 실제 설치본에 주입 후 모든 후킹 지점과 메모리 코드 검증을 통과했습니다. 구버전 외부 관전자 멀티 기록 `2026-10-12_23-39-14_0e4ed727.kufreplay`의 초기 상태 및 초기 구간 재생 검사를 통과했습니다. 전체 경기/실제 제보 PC의 파일 일치는 미확인입니다.
 
+## 0.2.37: 제보된 Names 레코드 검증 및 시작 시 재적용
+
+- 새로 제보된 0.2.34 기록 3개는 이전에 조사한 이름 없는 4개와 다릅니다. `20-29-36_046ff517`에는 James/yunin, `20-54-51_0f7761c6`에는 James/yunin/superjosun, `21-11-20_cc7510c3`에는 James/superjosun이 들어 있습니다. 나머지 이름은 PlayerN 기본 문자열입니다.
+- 같은 이름 검증 함수를 초기 파일 로딩과 경기 시작에 사용합니다. 경기 시작에서 Names 레코드를 소비만 하던 경로를 검증·복원하도록 바꾸었습니다. 원본 파일·명령·난수·무결성 정보는 변경하지 않습니다. NM01은 엔진 파일 로딩 시 확인한 슬롯별 이름을 남깁니다.
+- 실제 제보 파일 3개를 Python staging 후 x86 네이티브 `readInput -> observerName`까지 검사해 위 이름과 일치했습니다. 첫 파일을 실제 게임에서 643틱까지 재생하며 게임 메시지 대상 CString +500/+504에 James/yunin이 복원된 것을 읽기 전용으로 확인했습니다. 자원판 출력 함수는 같은 observerName을 사용합니다. 실제 자원판의 시각 검증과 전체 경기 완주는 미확인입니다.
+
+## 0.2.39: 진영/아이디 색상 및 미니맵 상대 건물
+
+- 실행 중 게임을 읽기 전용으로 확인해 CPlayer +8의 Human=1000/Devil=2000/관전자=3000과 +5c0의 플레이어 색상 번호를 확인했습니다. 기존 참가자 필터를 유지하고 작은 R 열에 H/D를 출력합니다.
+- 글자 출력의 마지막 인자는 글자색이 아니라 폰트/플래그이므로 변경하지 않습니다. 네이티브 548387의 `\cHHHH` 형식에 현재 555/565 플레이어 팔레트(4e0d10/4e0d30, bea770/bea784)를 전달합니다. 아이디의 역슬래시는 이스케이프하고, 현황판 폭은 색상 태그를 제외한 실제 표시 글자 수로 계산합니다.
+- 미니맵의 +6==1 건물 경로(4b3372)는 지형 공개와 별개로 +14e8 발견 기록을 검사(4b3385)하고, 기록이 없으면 일부 중립 객체를 제외하고 숨깁니다. 이 비교 한 곳만 정확한 원본 바이트를 검증해 대체했습니다. playback/active/displayDepth/생산 스레드 조건에서만 표시하고 나머지 경우 원래 바이트를 읽습니다. 건물·시야 데이터를 덮어쓰지 않습니다.
+- 비교용 thunk는 EAX/ECX/EDX를 보존하고 원래 JNZ가 사용할 ZF를 전달합니다. 소유권이나 플레이어 시점을 바꾸지 않습니다. 등록된 코드 패치 무결성과 복원 경로를 그대로 사용합니다.
+- 네이티브 회귀 테스트: H/D 실제 enum, 555/565 글자색, ID 제어문자 이스케이프, 발견 안 된 건물의 표시 범위, HP/발견 기록 불변, thunk 레지스터/ZF 보존. Python 46개 통과. 현재 사용자가 실행 중인 게임은 변경하지 않았으며 수정 후 실제 화면/전체 경기 검증은 미확인입니다.
+
+## 0.2.40: 미정찰 건물 표시 범위, 사망 음원 예외, Workers
+
+- 0.2.39의 미니맵 비교 후킹은 displayDepth가 필요하지만 레이어의 픽셀 생성 호출이 이를 명시적으로 열지 않았습니다. 4b2fa0 호출을 observerDisplay로 감싸 실제 적용 범위와 지형/투명 표시를 보장합니다. 더티 플래그·타이머 및 모든 임시 시야 값은 기존 finally 경로로 복원합니다.
+- 본 화면 건물은 준비 단계 이후 47ad13에서 +6b를 다시 검사합니다. 47ad00의 정확한 프롤로그를 검증해 건물 실제 그리기를 감싸 +69/+6b와 전역 표시 안개만 임시 처리합니다. +3c 카메라 클리핑과 실제 탐험/발견/소유권/명령 상태는 유지합니다. 정상/예외 모두 복원합니다.
+- 리소스 fx.map의 명시적인 `;dead` 구역(예: pe108..113, wa114..118)을 확인했습니다. 네이티브 유형별 event-4 음원 범위 55개가 있으며, 선택 대사 2502는 이 범위에 포함되지 않습니다. 일반 nonspatial/spatial 대사 차단에서도 해당 사망 ID는 원래 리소스 객체로 전달합니다.
+- 실행 중 이전 엔진의 오디오 슬롯에서 2554/2556/2558 등 사망 ID의 네이티브 버퍼 생성을 읽기 전용으로 확인했습니다. 따라서 기존 death-submitted만으로 실제 들림을 단정할 수 없습니다. 새 AU01에는 death-accepted/rejected/onscreen/last-death를 나눠 기록합니다.
+- 540c10의 지속 공간음 갱신은 시작 호출과 달리 원래 카메라·HUD 너비를 쓰고 너비 변경을 캐시에 반영하지 않았습니다. 동일한 표시 카메라/확장 너비를 스코프로 제공하고 너비 변경 때 오디오 위치 캐시만 무효화합니다. 공유 카메라/뷰포트는 finally에서 복원합니다.
+- Farm을 Workers로 바꾸고 살아 있는 Peasant/Gnome Slave(유형 0/15, 객체 종류 0, 종료 상태 0, HP 양수)를 집계합니다. 의미가 입증되지 않은 +67 플래그 때문에 살아 있는 일꾼을 제외하지 않습니다.
+- 네이티브 테스트: 건물 그리기/예외 복원, 명시적 미니맵 표시 범위, 사망 ID의 대사 차단 통과 및 선택 대사 음소거, 지속 믹서의 표시 좌표/너비/캐시와 공유 값 복원, 양 진영 일꾼/사망/건물 제외. Python 46개 통과. 사용자가 실행 중인 게임에 패치를 추가하지 않았으며 수정 후 실제 화면 및 청취는 미확인입니다.
+
 ## 상태 코드
 
 | 코드 | 의미 |
@@ -274,3 +298,122 @@ Python 테스트 25개 및 C++ 콜백 시험 통과: 상태 해제 후 종료, �
 | 10 | 기록된 최종 상태 도달 |
 | 11 | 디스크 쓰기/flush/완료 처리 실패 |
 | 12 | 등록된 후킹 이외의 실행 코드 변경 감지 |
+
+### 0.2.41 클로킹 실제 렌더
+KUFCHAR vtable+60은 4949f0이며 494a08에서 vtable+98(48ffe0)을 호출한다. 이 조건은 화면 범위 +3c, 투명 +69, fog +6b를 검사한다. 준비 콜백 밖에서 호출되는 실제 렌더에 observerObjectDisplay를 적용하고 __finally로 두 표시 바이트와 global fog를 복원한다. +3c와 소유자 및 시뮬레이션 데이터는 변경하지 않는다. 실제 클로킹 재생 화면은 미확인.
+
+### 0.2.42 ID 색상 정정
+548387의 \cHHHH는 raw RGB가 아니라 글꼴 팔레트 인덱스다. 54a665는 해당 값*64로 글꼴 팔레트를 참조하며 font+40이 활성화되면 font+44 팔레트가 우선한다. 54a000을 범위 검증된 엔트리 패치로 감싸 정확히 일치하는 현황판 ID 마커만 제거하고, indexed bitmap 글꼴에 플레이어 색상의 32단계 음영 팔레트를 적용한다. 원래 글꼴 override와 팔레트는 __finally로 복원한다. 그 외 텍스트와 일반 게임은 원래 경로로 진행한다.
+
+실제 리플레이 실행에서 현황판 font face=4, b40d64[4]=2(직접 16비트 비트맵)를 확인했다. 이 경로는 네이티브 팔레트를 무시하므로 54a72a→638750 문자 전용 blit 호출에 한정해 RLE 글리프 사본의 RGB를 착색한다. 알파·투명 구간·run 헤더와 원본 폰트 리소스는 유지하고 행/run 길이와 총 사본 크기를 제한한다. ID 외 텍스트·다른 스프라이트에는 적용하지 않는다.
+
+동일 실행에서 ID01 paints는 증가하지만 bitmap-glyphs=0이었다. 현재 PC는 GDI 글리프 경로를 사용하며 54a8d2는 font+40 활성화 시 +46의 단일 전경 RGB를 사용한다. 따라서 face4도 +46에 플레이어 RGB를 지정하고 override를 켠다. GDI와 bitmap fallback을 함께 처리하며 glyph tint 적용 여부/실패 건수를 ID01 로그에 남긴다.
+
+### 0.2.43 종료 후 결과 화면
+593f80의 상태 분기에서 app+128=16은 5978d4로 진입한다. 597937은 game vtable+6c(4d35b0)를 호출해 CGameResultMenu(7229b0)를 만들고 597948에서 state17로 전환한다. End 상태·최종 cursor 검증 성공(notice10) 후 다음 applicationHook에서 598820(app,16)을 한 번 호출한다. 명령·큐 임시 변경 scope 밖에서 실행하며 simulation은 terminal로 계속 정지한다. failed/불완전 초기화에는 진입하지 않는다. 기록이 중도 종료된 경우 최종 승패는 보장되지 않으며 표시 통계는 기록 종료 시점이다. 실게임 결과 조작 검증 미완료.
+
+### 0.2.44 건설 표시와 완성 본체
+47afdd는 +14d9가 0이면 건설 스프라이트(단계 +14a6)와 완성 디테일 전체를 생략한다. 두 표시 scope에서 이를 임시 공개하고 __finally에서 복원한다. 47aa6f..47aaa3은 fog가 있을 때 완성 본체의 시각 리소스 초기화(vtable+15c=478440)를 생략한다. 해당 함수는 타일 그래픽/디테일 리소스를 만들고 +14d8에 준비 상태를 기록한다. enterObserverDisplay에서 kind1, live HP/state, 완성 단계0, 준비되지 않은 경우에만 동일 native state exclusions를 확인한 뒤 호출한다. +14d8는 실제 생성한 렌더 리소스의 생명주기 상태이므로 유지하며 원래 업그레이드 reset(47b6f3), 파괴와 destructor가 소유한다. +14e8 발견 여부와 건설 단계·경제/명령 상태는 변경하지 않는다. BD01에 준비/건설 렌더 횟수를 기록한다. 실전 제보 구간은 미확인.
+
+### 0.2.45 관전자 선택 원
+494f61/494f6a와 47af36/47af3c는 +4e 또는 +3d가 있어야 선택 원 sprite(+84)를 그린다. 494f82는 상대 관계 경로에서 +4f도 요구한다. +3d는 4969b1의 카운터 기반 깜빡임 상태이므로 건드리지 않는다. observerObjectDisplay에서 살아 있는 observerSelected 대상에 한해 +4e/+4f=1, 나머지=0으로 그린 뒤 두 바이트를 __finally에서 복원한다. 원래 선택·명령 배열은 변경하지 않는다.
+
+### 0.2.46 중립 자원 정보
+RESOURCE_GOLD/STEEL/MANA의 RTTI vtable은 a3db54/a3d9c4/a3dce4이며 kind1이다. vtable+24=529b90은 +14f8의 남은 자원량을 읽고, native 정보창 507083은 이를 호출해 잔량을 출력한다. HP는 native 정보창이 +14/+16을 사용한다. observerInspectable에서 해당 중립 클래스는 HP0도 허용하되 종료 상태는 배제한다. 정보창 clone의 선택 슬롯에는 자원을 넣고 viewing player/owner UI pointer는 기존 것을 유지한다. 일반 유닛·건물의 owner0..7/HP 제한과 fog proxy 배제는 유지한다. 자원량·체력은 변경하지 않는다.
+
+
+### 0.2.47 결과 화면 안전 종료와 관전자 추가 표시
+제보 덤프 EIP 003488c5(image base001b0000)는 정적 주소5988c5이며 ECX/ESI가0이다. 결과 화면 확인은 597a48에서 존재하지 않는 오프라인 로비(bed1f8)에 5988c0을 호출했다. 결과 버튼 처리7241e0의700..703은 원래 통계 모드 전환을 유지하고704만 검증 완료 결과 화면에서 복원·PostQuitMessage 경로로 처리한다. 결과 화면 WM_LBUTTONDOWN은 관전자 선택으로 소비하지 않는다. LocusGameChain은 종료하지 않는다.
+
+건물 선택 원은 시뮬레이션 준비47872d..478770에 의존한다. 관전자 선택은 그 준비를 실행하지 않으므로 표시 중에만 +84 sprite의 월드 좌표와 b36338[type]+41 프레임을475930으로 준비한다. 전체 시뮬레이션 함수는 호출하지 않으며 선택 플래그는 원래 값으로 복원한다.
+
+observer_overlays.h는 b3e8e0 초상화 카탈로그/RTTI로 확인한 hero type29..35,105..108,111만 표시한다. HP는+14/+16, MP는 native48eb40/48eba0과 같은+2fc/+300(+3f8 bit8이면0)이다. b8280c+14[type]에 로드된 원본 portrait를 빌려 독립 CSprite로 그리며 결과 화면 전에 해제한다. H와U는 표시만 바꾼다.
+
+연구 진행47c590의+1488 phase1, +1484 remaining과 b3bae8 tick interval을 읽는다. remaining*interval<=5000에서 알림을 만들고 원래 함수가 remaining1 이하에서 phase0으로 끝낸 경우에만 완료 효과를 시작한다. 취소·파괴는 제거한다. icon은 원래514413 경로와 같이 b870f4[type*af8]의 command 목록을 b82824[command*200]의 code500/research ID와 대조해 읽는다. 완료 효과는 시뮬레이션 시간2500ms이며 전투 시뮬레이션 데이터는 변경하지 않는다. OV01에 영웅 수와 알림/완료 카운터를 기록한다.
+
+자동 검증: Python46개 및 native 회귀 테스트 통과. 실제 재생에서 2명 영웅 초상화·HP/MP와 업그레이드 아이콘/카운트다운, OV01 연구 완료 카운터를 확인했다. 영웅12종 전체·모든 연구 아이콘·모든 건물 선택 원 조합의 실전 검증은 미완료다.
+
+실제 결과 화면 검증: 종료 구간을 짧게 자른 테스트 trace에서 native 결과 화면에 도달한 뒤 유닛(생산/제거/손실), 건물(건설/파괴), 자원(금/철/마나 채취), 합계 버튼을 각각 눌러 다른 통계로 전환됨을 확인했다. 확인 클릭 뒤 RS02 로그와 테스트 게임 프로세스 종료를 확인했으며 새 크래시 파일은 생성되지 않았다. 테스트 trace는 원본 리플레이를 수정하지 않은 별도 build 파일이다.
+
+추가 실제 화면 검증: 새 DLL로 전체 원본 리플레이를 시작하여 Keep 건물 둘레의 선택 원을 확인했다. 초상화 및 연구 아이콘의 좌표는 화면상 원본 스프라이트 기준점에 맞춰 텍스트 옆으로 정렬했다. H 전환은 자동 회귀 테스트로 확인했으며 모든 영웅 조합의 실제 H/U 표시 전환은 추가 확인이 필요하다.
+
+
+### 0.2.48 관전자 패널 하단 배치
+제보 화면에서 초상화 원본 프레임 기준점 때문에 sprite 좌표보다 약27px 오른쪽/아래에 보이는 것을 반영해 hero sprite anchor를 x-27/y-27로 보정했다. 텍스트는 x+80에 배치하며 80px 행/240px 열을 사용한다. 실제 viewport 높이에서 하단12px(overflow 안내가 있으면32px)를 빼고 표시 개수에 맞춰 위로 쌓는다. 오른쪽260px 업그레이드 영역을 위해 영웅 열 수를 제한한다. 연구 알림은 viewport 우하단에서 시작해64px씩 위로 쌓고 icon anchor를24px 보정한다. H/U와 연구/영웅 수집 및 시뮬레이션은 변경하지 않았다. 네이티브 회귀 테스트와 실행 파일 빌드 통과; 수정 후 실제 재생 화면은 미확인이다.
+
+
+### 0.2.49 트래킹 해제
+기존 toggleObserverTracking은 observerTracked==observerSelected일 때만 해제했다. 관전자 선택이 달라지면 해제 동작이 새 선택 대상으로 추적을 시작했다. 이제 observerTracked>=0이면 선택 조회보다 먼저 stopObserverTracking으로 반환한다. 정지 시 좌표나 선택 상태를 변경하지 않는다. 두 유효 유닛을 가진 fixture에서 선택을 바꾸고 해제한 뒤 원래 유닛이 이동해도 카메라가 고정되는지 검증했다. 사망·슬롯 재사용·동일 선택 해제 테스트도 통과했다. 실게임 재현은 미확인이다.
+
+
+### 0.2.50 이미지 원점 보정과 HUD 인접 알림
+0.2.48의 고정27px 빼기는 잘못된 보정이었다. 475330은 sprite+78 이미지 vtable+68(frame,0)/+6c(frame,0)의 기준점을 sprite 좌표에서 뺀다. 그러므로 drawObserverSprite는 원하는 좌상단에 해당 기준점을 더해 저장한다. 수평 flip flag+14 bit10이면 원래 함수와 동일하게 vtable+60(frame)의 폭에서 기준점을 뺀다. 16비트 좌표와 기준점 범위도 검사한다. 프레임/초상화/명령 아이콘별 원점 차이를 그대로 반영하고 게임 자산은 수정하지 않는다.
+영웅54px 초상화는4줄 텍스트64px 영역에5px 세로 여백으로 중앙 배치하고 텍스트는62px 지점에서 시작한다. 업그레이드는48px 아이콘 옆56px 지점에2줄 텍스트를8px 아래로 배치한다. 알림 너비는 표시 ID/상태 문자열의 최대 길이에 맞추며 viewport 우측 HUD 경계8px 여백을 사용한다. 기존 하단 배치와 H/U 토글을 유지한다. 네이티브 회귀 테스트/빌드 검증, 실게임 변경 화면은 미확인이다.
+
+
+### 0.2.51 원래 플레이어 카메라와 관전자 해제 분리
+0.2.49의 toggle 수정만으로는 기본 카메라의 선택 추적을 차단하지 못했다. native53cee0은 CPlayer+170c/+1710의 원래 선택으로 목표 좌표를 계산하고53d0b8..53d0c5 및53d0f7..53d359에서 b869c4/c8을 다시 갱신한다. 관전자 추적 중에는 표시 override가 이를 가렸지만 해제하면 그 경로가 드러난다.
+53cee0 진입6바이트(55 8b ec 83 ec 30)를 검증하여 playback 전용 후킹한다. producer의 표시 처리에서만 +170c count를 임시0으로 두고 원래 함수를 실행하며 __finally로 복원한다. 원래 선택 배열·명령·유닛·난수는 건드리지 않고53d374 이후의 수동 가장자리/키보드 스크롤은 유지한다. inDispatch/기록 중/비producer는 원래 함수에 그대로 전달한다. 패치는 기존 .text 무결성 허용 목록과 복원에 포함된다.
+추적 표시를 실제 동기화한 좌표를 따로 저장하고 명시적 해제/대상 소멸 시 release를 예약한다. 다음 enterObserverDisplay에서 그 좌표를 global camera, terrain67c5c0, 두 region630930, CGame+9c4/+9c8에 반영하고 한 번만 해제한다. 이후 프레임은 고정하지 않아 사용자가 수동으로 이동할 수 있다. 정상 결과/종료 경로는 이 예약을 초기화한다.
+회귀 테스트에서 원래 선택이 있는 native camera 모형의 임의 대상 추적을 차단하고, 수동 스크롤과 원래 선택 개수의 예외 복원, release 프레임의 마지막 표시 위치와 캐시 일치, 다음 프레임의 자유 이동을 확인했다. 실제 변경 DLL 재생은 사용자 게임 실행 중이라 미확인이다.
+
+
+### 0.2.53 영웅 레벨과 초상화 추적
+native511a2f는 unit+35c를10진 문자열로 변환하고511a46..511a71은 Level 라벨로 표시한다. 같은 값을 영웅 snapshot에 포함하고 영웅 이름 뒤 Lv.N으로 표시한다. 매 표시 프레임마다 실제 그리기 성공한54x54 초상화의 logical 화면 RECT와 index/객체 포인터/type/owner를 저장한다. WM_LBUTTONDOWN에서 일반 지도 picking보다 먼저 client 크기 대비 bf2578/bf257c 비율로 변환해 초상화 영역을 검사한다. 현재 객체 동일성·생존·hero type/owner를 검증하고 관전자 선택/추적만 변경한다. H/U/terminal에서는 hit를 무효화하며 같은 영웅 클릭도 추적 유지다. 원래 플레이어 선택과 명령은 호출하지 않는다. 회귀 테스트에서 클릭 즉시 중앙 정렬, 반복 클릭, H/U 숨김, 사망, manager 슬롯 교체에 대한 동작을 확인했다. 실제 게임 입력 검증은 미완료다.
+
+
+### 0.2.54 실제 영웅 레벨 필드 정정
+0.2.53에서511a2f의 EBX를 유닛으로 잘못 해석했다. EBX는 UI 정보창이며 +35c는506bd2에서 setter 인자로 저장한 캐시다. 503ece..503ed6은 실제 유닛의 vtable+d4를 호출하며 KUFCHAR 관련 vtable에서 그 대상은48eb30(mov ax,[ecx+1a8];ret)이다. 실제 레벨은 unit signed WORD+1a8이며4971cf/48d06b에서 기본 생성/레벨 상승 시 갱신한다. 따라서 기본 레벨을 하드코딩해 더하지 않고 현재 실제 레벨을 읽는다.
+회귀 fixture에서 러셀런트 type105/로리아나108의 live레벨5와 다른 unit+35c 값99, 인접WORD20을 동시에 설정해 정확히5로 표시되는지 확인했고 live레벨7 변경도 확인했다. 실게임 화면 대조는 미확인이다.
+
+
+### 0.2.55 미니맵 알람 표시 제외
+RTTI KUFSMALLMAPEFFECT_RENDERER vtable a32254의 +8은4b4630이다. 이 함수는 effect vector를 진행하고4b46b6에서4b1e60 이미지 blit을 호출하며4b46cb 이후 만료 효과를 제거한다. 따라서 renderer 전체를 건너뛰지 않고 해당 E8 호출만 검증/대체하여 active playback에서 그리기만 생략한다. 큐 진행·수명 정리·원래 이벤트 및 시뮬레이션은 그대로 실행하며 다른 작은지도 renderer4b3ff0/4b2fa0은 유지한다. 다른 출력 호출이나 효과음은 변경하지 않는다. 기존 패치 무결성 관리/복원에 포함한다. 재생 외 전달/재생 중 출력 생략 회귀 테스트 통과. 실제 ping 구간은 미확인이다.
+
+
+### 0.2.56 읽기 전용 빌드오더
+build_order.py는 기존 archive validate/규칙SHA/지원 게임SHA/trace parser를 사용한다. 같은 ZIP를 재열 때 항목 집합·합계 크기·manifest/initial 크기와 command SHA를 재확인한다. 게임을 실행하거나 리플레이에 새 데이터를 쓰지 않는다. 레코드 Before의 monotonic tick과 Begin tick 차이 및 metadata/bootstrap tickInterval로0..300000ms를 계산한다. 동시각 명령의 순서와 반복 지시는 그대로 보존한다. 분석 이벤트는20000개로 제한한다.
+4db870 dispatcher에서 WORD+0은 opcode, WORD+2는 실행 플레이어다.400/401 및500은8byte packet의 DWORD+4에 unit/research ID가 있고170/5170은12byte packet의 DWORD+8에 건물 ID, WORD+4/+6에 좌표가 있다.5170은 queued build 분기다. 다른 명령을 생산으로 추정하지 않는다. native unit 판정/큐 실제 접수·자원/완료 결과는 오프라인 명령만으로 확정하지 않으므로 화면을 지시 목록으로 명시한다. 연구0/1/45 등 Upgrade to 명령은 건물 업그레이드로 분류한다.
+명칭은 지원 설치본res11.res의 KCF(version6, ID+36/name+40)와 KufButton.kmf(version2, header56, stride512)의 command code+8/ID+12/짧은 title+20을 대조하여 build_order_catalog.py에 표기 이름만 수록했다. 원본 이미지/실행 코드/리소스 파일은 포함하지 않는다. 이름이 확인되지 않으면 ID를 보존한다. 각 이벤트의 플레이어 번호와 원래 기록 Names를 연결하며, bootstrap의 기본 race만 보고 빈 슬롯을 참가자로 추정하지 않는다.
+UI는 background work로 분석하고 Tk main thread에서 Toplevel/Notebook을 만든다. 목록 버튼과 우클릭(클릭한 행을 선택)으로 진입한다. 실제 기록5개의 분석·원본 SHA 불변, 전체/James 탭의 실제 UI 전환, 생산/예약건설/연구/기본명/잘린 명령/5분 경계/다른 tick간격 테스트를 확인했다. 완료 시각이나 실패/취소 결과 복원은 미구현이다.
+
+설치된0.2.56 실행 파일에서도 목록 우클릭 메뉴 노출과 빌드오더 보기 버튼을 통한 새 창 진입을 확인했다. GroundZero 기록은114개 지시와 James/superjosun 탭으로 표시됐다.
+
+
+### 0.2.57 build-order population metadata
+
+The game thread reads CPlayer+0xe24 and native capacity (0x522760) immediately before
+an opening build/production/research command. It queues a writer-only Population
+record with the ordinal of the command among ALL commands, tick and owner. The
+worker writes KUFPOP01 + packed <5I> records to <capture>.partial.population;
+Population never enters commands.bin. Sampling is bounded to 1500 entries in the
+first 300000 ms. Disk I/O stays in the worker. Replay snapshots/RNG/checksums and
+protocol-v1 playback remain unchanged.
+
+Packaging validates sample ordinal/tick/owner against the authenticated trace and
+adds optional build_order_population [[ordinal,used,capacity],...] before signing
+manifest.json. Missing or invalid optional metadata cannot block saving a replay.
+Closed-process recovery retains matching samples and ignores samples beyond the
+retained command prefix. A torn final sidecar record is ignored. Old files display
+an em dash rather than an inferred supply value. Above-cap population is valid.
+The read-only comparison window uses separate player selectors and independent
+scrolling. Colored category markers are not game unit portraits.
+
+Validation: 54 Python tests, native regression suite and source-window visual
+inspection. In-game before-command population versus displayed values, including
+multiplayer and abrupt-close timing, still needs live verification.
+
+
+### 0.2.58 build-order activity images
+
+The launcher reads MenuIcon8.URE from installed res6.res and optional loose
+res/misc/MenuIcon8_2.URE. KufButton.kmf in res11.res maps opcode/entity IDs to
+sprite sequence indices (1000+ selects the expansion atlas). Build and queued
+build normalize to menu opcode 300; both production variants normalize to 400.
+URE v1 RGB555 runs and URE v2 flag-1 separate RGB/alpha streams are decoded with
+bounded dimensions, frame ranges and run lengths. Native reference: 6101b0
+(format flag), 639f90 (byte block length), 6398b0 and 639750 (color/alpha runs).
+Only 26px PNG thumbnails are created in memory; no game graphics are distributed.
+Missing assets leave activity text usable. No trace or simulation changes.
+Validation: Python 57 tests, actual 112/112 event icon coverage on the Sylphid
+record including Lauriana, and visual inspection of unit/building rows.

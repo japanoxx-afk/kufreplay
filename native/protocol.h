@@ -14,8 +14,10 @@ constexpr char Magic[8] = {'K','U','F','T','R','C','0','1'};
 constexpr uint32_t MaxCommand = 2048;
 constexpr uint32_t MaxFile = 128u * 1024 * 1024;
 // TrimEnd is internal to the writer queue; archives contain only standard End records.
-enum Kind : uint32_t { Begin = 1, Before = 2, Command = 3, After = 4, End = 5, TrimEnd = 6, Setup = 7, Bootstrap = 8, Names = 9 };
+enum Kind : uint32_t { Begin = 1, Before = 2, Command = 3, After = 4, End = 5, TrimEnd = 6, Setup = 7, Bootstrap = 8, Names = 9, Population = 10 };
 #pragma pack(push, 1)
+// Population is writer-only metadata, never part of the replay command stream.
+struct PopulationSample { uint32_t ordinal, tick, player, used, capacity; };
 struct Record { uint32_t kind, size; };
 struct State { uint32_t tick, seed, randomCount, checksum; };
 struct Initial {

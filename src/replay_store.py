@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import uuid
 import zipfile
+import struct
 from datetime import datetime
 from pathlib import Path
 
@@ -16,6 +17,28 @@ MAX_MANIFEST = 64 * 1024
 ALLOWED = {'manifest.json', 'initial.bin', 'commands.bin', 'rng.bin', 'checksums.bin', 'map.bin'}
 REQUIRED = ALLOWED - {'manifest.json'}
 SHA = re.compile(r'^[0-9a-f]{64}$')
+
+def player_names_text(path):
+    """Read only the bounded native name header, including older manifests."""
+    try:
+        with zipfile.ZipFile(path) as z, z.open('commands.bin') as f:
+            if f.read(8)!=b'KUFTRC01' or f.read(8)!=struct.pack('<II',1,664):
+                return '이름 정보 없음'
+            if len(f.read(664))!=664 or f.read(8)!=struct.pack('<II',9,516):
+                return '이름 정보 없음'
+            data=f.read(516)
+            if len(data)!=516 or struct.unpack_from('<I',data)[0]!=1:
+                return '이름 정보 없음'
+            names=[]
+            for i in range(8):
+                field=data[4+i*64:4+(i+1)*64]
+                if b'\0' not in field: return '이름 정보 오류'
+                name=field.split(b'\0',1)[0].decode('cp949')
+                if any(ord(c)<32 or ord(c)==127 for c in name): return '이름 정보 오류'
+                if name and name!=f'Player{i+1}': names.append(name)
+            return ', '.join(names) if names else '이름 정보 없음'
+    except (OSError,ValueError,KeyError,UnicodeError,zipfile.BadZipFile,RuntimeError):
+        return '이름 정보 오류'
 
 def data_root():
     return Path(os.environ.get('LOCALAPPDATA', str(Path.home() / 'AppData' / 'Local'))) / 'KUFReplay'
@@ -110,6 +133,8 @@ class Store:
         for p in self.replays.glob('*.kufreplay'):
             try:
                 m = validate(p)
+                # Display-only enrichment; never written into the signed manifest.
+                m['_player_names_display']=player_names_text(p)
                 items.append((p, m, p.name in self.config['permanent']))
             except (ValueError, OSError, zipfile.BadZipFile, KeyError, TypeError, UnicodeError, RuntimeError):
                 continue

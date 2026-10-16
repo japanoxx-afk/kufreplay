@@ -202,7 +202,38 @@ def resolve_map(game, trace):
         raise ValueError('설치 폴더 안에서 기록한 .kfm 지도를 찾지 못했습니다')
     return candidate
 
-def package_capture(source, game, store, recovery=None):
+def read_population(source, trace):
+    source=Path(source)
+    if source.name.endswith('.complete'):
+        source=source.with_suffix('')
+    sidecar=Path(str(source)+'.population')
+    if not sidecar.exists():
+        return []
+    if sidecar.stat().st_size>30008:
+        raise ValueError('보급 메타데이터 크기 제한 초과')
+    raw=sidecar.read_bytes()
+    if raw[:8]!=b'KUFPOP01':
+        raise ValueError('보급 메타데이터 헤더 오류')
+    commands=[command for _,batch,_ in trace.frames for command in batch]
+    start=struct.unpack_from('<I',trace.initial)[0]
+    interval=BOOTSTRAP.unpack(trace.bootstrap)[7] if trace.bootstrap else 30
+    result=[];seen=set()
+    for offset in range(8,len(raw)-19,20):
+        ordinal,tick,player,used,capacity=struct.unpack_from('<5I',raw,offset)
+        if ordinal>=len(commands):
+            continue # Recovery may intentionally discard the final batch.
+        command=commands[ordinal];data=command[3]
+        opcode=struct.unpack_from('<H',data)[0]
+        if (ordinal in seen or command[0]!=tick or len(data)<4 or
+            struct.unpack_from('<H',data,2)[0]!=player or player>=8 or
+            opcode not in (170,5170,400,401,500) or used>1000000 or capacity>1000000 or
+            not 0<=(tick-start)*interval<=300000):
+            raise ValueError('보급 메타데이터 명령 불일치')
+        seen.add(ordinal);result.append([ordinal,used,capacity])
+    return result
+
+
+def package_capture(source, game, store, recovery=None, population_source=None):
     source = Path(source)
     if source.stat().st_size > MAX_TRACE:
         raise ValueError('기록 크기 제한 초과')
@@ -236,6 +267,12 @@ def package_capture(source, game, store, recovery=None):
                 'recording_mode':'multiplayer' if trace.network_mode else 'singleplayer',
                 'playback_supported':playable,
                 'multiplayer_supported':bool(trace.bootstrap)}
+    try:
+        population=read_population(population_source or source,trace)
+    except (OSError,ValueError):
+        population=[] # Optional display metadata must never prevent replay saving.
+    if population:
+        metadata['build_order_population']=population
     if recovery:
         metadata['recovery']=recovery
     # Exact time uses tick_interval_ms; tick_rate is retained for format-v1 readers.
@@ -287,7 +324,7 @@ def recover_closed_capture(source, game, store):
             'reason':'missing-end-record', 'source':source.name,
             'discarded_batches':1, 'discarded_commands':original.commands-trace.commands,
             'truncated_tail_bytes':len(raw)-complete_end,
-            'final_tick':trace.final[0]})
+            'final_tick':trace.final[0]},population_source=source)
     finally:
         temporary.unlink(missing_ok=True)
 

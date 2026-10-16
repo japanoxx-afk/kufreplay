@@ -8,6 +8,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from replay_store import Store, validate, REQUIRED
+from replay_store import player_names_text
+import struct
 from updater import version_tuple
 
 def fixture(path, when='2026-10-11T12:00:00+09:00', extra=None, corrupt=False, complete=True, metadata=None):
@@ -112,6 +114,23 @@ class StoreTests(unittest.TestCase):
         self.assertGreater(version_tuple('v0.2.0'), version_tuple('0.1.0'))
         with self.assertRaises(ValueError):
             version_tuple('../../malicious')
+
+    def test_native_name_header_display_and_missing_legacy_names(self):
+        prefix=b'KUFTRC01'+struct.pack('<II',1,664)+bytes(664)
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)/'names.kufreplay'
+            names=['James','한글아이디','superjosun']+[f'Player{i}' for i in range(4,9)]
+            data=struct.pack('<I',1)+b''.join(n.encode('cp949').ljust(64,b'\0') for n in names)
+            with zipfile.ZipFile(path,'w') as z:
+                z.writestr('commands.bin',prefix+struct.pack('<II',9,516)+data)
+            self.assertEqual(player_names_text(path),'James, 한글아이디, superjosun')
+            with zipfile.ZipFile(path,'w') as z:
+                z.writestr('commands.bin',prefix+struct.pack('<II',2,16)+bytes(16))
+            self.assertEqual(player_names_text(path),'이름 정보 없음')
+            bad=struct.pack('<I',1)+b'x'*512
+            with zipfile.ZipFile(path,'w') as z:
+                z.writestr('commands.bin',prefix+struct.pack('<II',9,516)+bad)
+            self.assertEqual(player_names_text(path),'이름 정보 오류')
 
 if __name__ == '__main__':
     unittest.main()

@@ -10,6 +10,7 @@ from replay_store import Store
 from updater import VERSION, download_latest
 from engine import ADAPTER, launch_engine, collect_completed, process_alive, replay_time
 from diagnostics import create_report, log_error
+from build_order import load_build_order
 
 DEFAULT_GAME = Path(r'C:\Program Files (x86)\Steam\steamapps\common\Kingdom Under Fire War of Heroes\KingdomUnderFire.exe')
 
@@ -24,7 +25,7 @@ class Launcher:
         self.rows = {}
         self.shortcut_window = None
         root.title(f'KUF 리플레이 런처 {VERSION}')
-        root.geometry('980x620')
+        root.geometry('1120x620')
         root.minsize(840, 560)
         outer = ttk.Frame(root, padding=18)
         outer.pack(fill='both', expand=True)
@@ -49,8 +50,8 @@ class Launcher:
         ttk.Label(settings, text='영구저장 경기는 자동 삭제에서 제외').pack(side='left', padx=16)
         frame = ttk.Frame(outer)
         frame.pack(fill='both', expand=True)
-        self.tree = ttk.Treeview(frame, columns=('date', 'map', 'duration', 'pin', 'compat'), show='headings', selectmode='browse')
-        for col, label, width in [('date','기록 시각',210), ('map','지도',170), ('duration','길이',70), ('pin','영구저장',80), ('compat','재생 상태',270)]:
+        self.tree = ttk.Treeview(frame, columns=('date', 'map', 'players', 'duration', 'pin', 'compat'), show='headings', selectmode='browse')
+        for col, label, width in [('date','기록 시각',165), ('map','지도',190), ('players','플레이어',245), ('duration','길이',65), ('pin','영구저장',65), ('compat','재생 상태',270)]:
             self.tree.heading(col, text=label)
             self.tree.column(col, width=width)
         self.tree.pack(side='left', fill='both', expand=True)
@@ -58,9 +59,13 @@ class Launcher:
         scroll.pack(side='right', fill='y')
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.bind('<Double-1>', lambda _: self.play())
+        self.build_menu = tk.Menu(root, tearoff=False)
+        self.build_menu.add_command(label='빌드오더 보기', command=self.show_build_order)
+        self.tree.bind('<Button-3>', self.build_context_menu)
         actions = ttk.Frame(outer)
         actions.pack(fill='x', pady=10)
         ttk.Button(actions, text='선택 리플레이 재생', command=self.play).pack(side='left')
+        ttk.Button(actions, text='빌드오더 보기', command=self.show_build_order).pack(side='left', padx=(8, 0))
         ttk.Button(actions, text='영구저장 / 해제', command=self.toggle_pin).pack(side='left', padx=8)
         ttk.Button(actions, text='단축키 매뉴얼', command=self.show_shortcuts).pack(side='left', padx=(0, 8))
         self.game_button = ttk.Button(actions, text='게임 실행 (Steam)', command=self.start_game)
@@ -70,6 +75,29 @@ class Launcher:
         self.work(self.store.listing, self.render)
         root.after(100, self.poll)
         root.after(2000, self.collect)
+
+    def build_context_menu(self, event):
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        self.tree.selection_set(row)
+        self.tree.focus(row)
+        try:
+            self.build_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.build_menu.grab_release()
+
+    def show_build_order(self):
+        item = self.selected()
+        if not item:
+            return
+        path = item[0]
+        self.work(lambda: load_build_order(path),
+                  lambda report: self.build_order_window(path, report), key='build-order:'+str(path))
+
+    def build_order_window(self, path, report):
+        from build_order_view import show_window
+        return show_window(self.root, path, report, Path(self.game_path.get()) if hasattr(self, "game_path") else DEFAULT_GAME)
 
     def show_shortcuts(self):
         if self.shortcut_window is not None and self.shortcut_window.winfo_exists():
@@ -88,7 +116,8 @@ class Launcher:
         shortcuts = [
             ('1 / 2 / 4', '재생 속도: 1배속 / 2배속 / 4배속'),
             ('I', '자원현황판 표시 / 숨기기'),
-            ('U', '오른쪽 HUD 표시 / 숨기기'),
+            ('U', '오른쪽 HUD·영웅 현황·업그레이드 알림 표시 / 숨기기'),
+            ('H', '영웅 초상화·체력·마나 현황 표시 / 숨기기'),
             ('T', '배속·경과시간·전체시간 표시 / 숨기기'),
             ('Ctrl + C', '선택한 유닛을 화면 중앙으로 추적 / 추적 해제'),
             ('Esc', '리플레이 종료 확인: 예 = 종료, 아니요 = 계속 재생'),
@@ -98,9 +127,9 @@ class Launcher:
         for row, (key, description) in enumerate(shortcuts, start=1):
             ttk.Label(body, text=key, font=('Segoe UI', 10, 'bold')).grid(row=row, column=0, sticky='w', padx=(0, 22), pady=6)
             ttk.Label(body, text=description).grid(row=row, column=1, sticky='w', pady=6)
-        ttk.Separator(body).grid(row=9, column=0, columnspan=2, sticky='ew', pady=12)
-        ttk.Label(body, text='게임 창에 포커스를 둔 상태에서 사용하세요.\nCtrl+C는 유닛 선택 후 사용하며, 지도 끝에서는 카메라 이동 범위가 제한됩니다.\nU로 HUD를 숨기면 시간 표시도 숨겨집니다. O키는 리플레이에서 비활성화됩니다.', wraplength=570).grid(row=10, column=0, columnspan=2, sticky='w')
-        ttk.Button(body, text='닫기', command=window.destroy).grid(row=11, column=0, columnspan=2, sticky='e', pady=(16, 0))
+        ttk.Separator(body).grid(row=10, column=0, columnspan=2, sticky='ew', pady=12)
+        ttk.Label(body, text='게임 창에 포커스를 둔 상태에서 사용하세요.\nCtrl+C는 유닛 선택 후 사용하며, 지도 끝에서는 카메라 이동 범위가 제한됩니다.\nU로 HUD를 숨기면 시간·영웅·업그레이드 알림도 숨겨집니다. O키는 리플레이에서 비활성화됩니다.', wraplength=570).grid(row=11, column=0, columnspan=2, sticky='w')
+        ttk.Button(body, text='닫기', command=window.destroy).grid(row=12, column=0, columnspan=2, sticky='e', pady=(16, 0))
         window.bind('<Escape>', lambda event: window.destroy())
 
     def collect(self):
@@ -174,7 +203,7 @@ class Launcher:
                 compat='멀티 자동 재생 · 실험용' if m.get('multiplayer_supported') else '멀티 기록 · 초기화 데이터 없음'
             if m.get('recovery'): compat='종료 누락 복구 · 마지막 배치 제외 · '+compat
             date_text=datetime.fromisoformat(m['recorded_at']).astimezone().strftime('%Y-%m-%d %H:%M:%S')
-            row = self.tree.insert('', 'end', values=(date_text, m['map_id'], time_text, '★' if pin else '', compat))
+            row = self.tree.insert('', 'end', values=(date_text, m['map_id'], m.get('_player_names_display','이름 정보 없음'), time_text, '★' if pin else '', compat))
             self.rows[row] = (p, m, pin)
             if p == selected_path:
                 self.tree.selection_set(row)

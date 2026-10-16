@@ -68,6 +68,8 @@ bool mapExceptionRestored(void* self) {
 }
 uint32_t __fastcall fakeResultRender(void*,void*) {return 123;}
 uint32_t __fastcall fakeFullSurface(void*,void*) {return 456;}
+unsigned alarmBlits=0;
+void __cdecl fakeAlarmBlit(const void*,void*,int,int,int) {++alarmBlits;}
 uint32_t voiceLoadCalls=0;
 uint32_t __fastcall fakeVoiceArchive(void*,void*,uint32_t,uint32_t archive,uint32_t) {++voiceLoadCalls;return archive;}
 void* nameDestination[8]{};char assignedNames[8][64]{};unsigned nameAssignments=0;
@@ -88,6 +90,50 @@ void __fastcall fakeCameraRegion(void* self,void*,int x,int y,int width,int heig
     if(width!=-1 || height!=-1) exit(2);
     ++regionCalls;((int*)self)[0]=x;((int*)self)[1]=y;
 }
+bool cameraThrows=false;
+void __fastcall fakeCameraInput(void* self,void*) {
+    if(cameraThrows) RaiseException(0xe0000124,0,0,nullptr);
+    if(*(int16_t*)((unsigned char*)self+0x170c)>0) at<int>(0xb869c4)=9900;
+    else at<int>(0xb869c4)+=7; // Manual scrolling still runs without a target.
+}
+bool cameraSelectionRestoredOnException(void* player) {
+    cameraThrows=true;
+    __try {observerCameraInputHook(player,nullptr);}
+    __except(EXCEPTION_EXECUTE_HANDLER) {cameraThrows=false;return *(int16_t*)((unsigned char*)player+0x170c)==1;}
+    cameraThrows=false;return false;
+}
+bool minimapFlagsPreserveRegisters(unsigned char* object,bool expectedVisible) {
+    unsigned char zero=0;uint32_t eaxValue=0,ecxValue=0,edxValue=0;
+    __asm {
+        push edi
+        mov edi,object
+        mov eax,1234
+        mov ecx,5678
+        mov edx,9012
+        call observerMinimapBuildingFlags
+        setz zero
+        mov eaxValue,eax
+        mov ecxValue,ecx
+        mov edxValue,edx
+        pop edi
+    }
+    return (zero==!expectedVisible) && eaxValue==1234 && ecxValue==5678 && edxValue==9012;
+}
+unsigned resultButtons=0;uint32_t resultButtonValue=0;
+uint32_t __fastcall fakeResultButton(void*,void*,uint32_t button) {++resultButtons;resultButtonValue=button;return button+1000;}
+int ringFrame=-1;
+void __fastcall fakeBuildingRingFrame(void*,void*,int frame,int variant) {if(variant) exit(2);ringFrame=frame;}
+uint32_t __fastcall fakeResearchStep(void* self,void*) {
+    auto object=(unsigned char*)self;
+    --*(int16_t*)(object+0x1484);
+    if(*(int16_t*)(object+0x1484)<=0) {*(int16_t*)(object+0x1488)=0;return 1;}
+    return 0;
+}
+unsigned resultTransitions=0;
+void __fastcall fakeResultTransition(void* self,void*,uint32_t state) {
+    if(state!=16) exit(2);
+    *(uint32_t*)((unsigned char*)self+0x128)=state;++resultTransitions;
+}
 bool processThrows=false;
 uint32_t __fastcall fakeNetworkProcess(void*,void*) {
     auto queue=at<void*>(0xb870c8);auto table=*(void***)queue;
@@ -102,17 +148,75 @@ bool processExceptionRestored(void* self) {
     __except(EXCEPTION_EXECUTE_HANDLER) {caught=true;}
     processThrows=false;return caught;
 }
+uint32_t __fastcall fakeObserverThrow(void*,void*);
+void* expectedPanelPlayer=nullptr;
+uint32_t __fastcall fakeResourcePanel(void* self,void*) {
+    auto ui=(unsigned char*)self;auto game=(unsigned char*)at<void*>(0xb8282c);
+    if(*(void**)(ui+0x23c)!=expectedPanelPlayer || *(uint32_t*)(game+0x664)!=2 || !observerPanelDrawing || *(int16_t*)(ui+0x1898)!=1 || *(int16_t*)*(void**)(ui+0x189c)!=0) exit(2);
+    auto resource=observerUnit(0);
+    if(!observerResource(resource) || *(int*)(resource+0x14f8)!=12500 || *(uint16_t*)(resource+0x14)!=0) exit(2);
+    return 654;
+}
+bool expectSelectionRing=false;
+uint32_t __fastcall fakeSelectionRingDraw(void* self,void*) {
+    auto object=(unsigned char*)self;
+    if(object[0x4e]!=(expectSelectionRing?1:0) || object[0x4f]!=(expectSelectionRing?1:0) || object[0x3d]!=5) exit(2);
+    return 987;
+}
+bool selectionRingExceptionRestored(void* self) {
+    bool caught=false;
+    __try {observerObjectDisplay(self,(Process)fakeObserverThrow);}
+    __except(GetExceptionCode()==0xe0000123?EXCEPTION_EXECUTE_HANDLER:EXCEPTION_CONTINUE_SEARCH) {caught=true;}
+    auto object=(unsigned char*)self;
+    return caught && object[0x4e]==7 && object[0x4f]==9 && object[0x3d]==5;
+}
+unsigned bodyPrepares=0;
+uint32_t __fastcall fakeBuildingBody(void* self,void*) {
+    auto object=(unsigned char*)self;
+    if(!displayDepth || object[0x6b] || object[0x14d9]!=1 || at<unsigned char>(0xb3ba61)!=1) exit(2);
+    object[0x14d8]=1;++bodyPrepares;return 0;
+}
 uint32_t __fastcall fakeObserverDraw(void* self,void*) {
     if(at<unsigned char>(0xb3ba61)!=1 || ((unsigned char*)self)[0x6b]!=0 || ((unsigned char*)self)[0x69]!=0) exit(2);
+    if(*(int16_t*)((unsigned char*)self+6)==1 && ((unsigned char*)self)[0x14d9]!=1) exit(2);
     ((unsigned char*)self)[0x6b]=7;return 321;
 }
+bool textDrawThrows=false,textExpectTint=false;
+uint32_t __fastcall fakeTextDraw(void* self,void*,const char* text,void* pixels,int x,int pitch,int height,int translate) {
+    auto font=(unsigned char*)self;
+    if(pixels!=(void*)0x1234 || x!=23 || pitch!=240 || height!=30 || translate!=0) exit(2);
+    if(textExpectTint && (strcmp(text,"James") || *(uint32_t*)(font+0x40)!=1 || *(uint16_t*)(font+0x46)!=observerPlayerColor(0))) exit(2);
+    if(textDrawThrows) RaiseException(0xe0000123,0,0,nullptr);
+    return 456;
+}
+bool textExceptionRestored(void* font,const char* text) {
+    bool caught=false;textDrawThrows=true;
+    __try {observerTextDrawHook(font,nullptr,text,(void*)0x1234,23,240,30,0);}
+    __except(GetExceptionCode()==0xe0000123?EXCEPTION_EXECUTE_HANDLER:EXCEPTION_CONTINUE_SEARCH) {caught=true;}
+    textDrawThrows=false;return caught && *(uint32_t*)((unsigned char*)font+0x40)==0 && *(uint16_t*)((unsigned char*)font+0x46)==0x1234 && observerIdTintDepth==0;
+}
 uint32_t __fastcall fakeObserverThrow(void*,void*) {RaiseException(0xe0000123,0,0,nullptr);return 0;}
+uint32_t __fastcall fakeMinimapProduce(void* self,void*) {
+    if(!displayDepth || at<unsigned char>(0xb3ba61)!=1 || !observerMinimapBuildingVisible((unsigned char*)self,nullptr)) exit(2);
+    return 777;
+}
+bool buildingExceptionRestored(void* self) {
+    bool caught=false;
+    __try {observerObjectDisplay(self,(Process)fakeObserverThrow);}
+    __except(GetExceptionCode()==0xe0000123?EXCEPTION_EXECUTE_HANDLER:EXCEPTION_CONTINUE_SEARCH) {caught=true;}
+    return caught && ((unsigned char*)self)[0x6b]==1 && ((unsigned char*)self)[0x69]==1 && at<unsigned char>(0xb3ba61)==0;
+}
 uint32_t __fastcall fakeAudio(void* self,void*,uint32_t a,uint32_t b,int x,int y,uint32_t c) {
     if(at<int>(0xbf2588)!=1066 || observerAudioVisibility(self,nullptr,7,x,y)!=1) {fprintf(stderr,"audio fixture width/depth %d/%u\n",at<int>(0xbf2588),observerAudioDepth);exit(2);}
     if(at<int>(0xb869c4)!=700 || at<int>(0xb869c8)!=800) {fprintf(stderr,"audio camera cache mismatch\n");exit(2);}
     return a+b+c;
 }
 uint32_t __fastcall fakeAudioThrow(void*,void*,uint32_t,uint32_t,int,int,uint32_t) {RaiseException(0xe0000123,0,0,nullptr);return 0;}
+uint32_t __fastcall fakeMixerUpdate(void* self,void*) {
+    if(at<int>(0xbf2588)!=1066 || at<int>(0xb869c4)!=700 || at<int>(0xb869c8)!=800 ||
+       *(int*)((unsigned char*)self+0xfcd20)!=(int)0x80000000u) exit(2);
+    return 876;
+}
 bool audioExceptionRestored(void* self) {
     bool caught=false;
     __try {observerAudio(self,(Audio)fakeAudioThrow,1,2,3,4,5);}
@@ -157,7 +261,14 @@ void require(bool condition,const char* message) {
 }
 }
 
-int main() {
+int wmain(int argc,wchar_t** argv) {
+    if(argc==2) {
+        require(readInput(argv[1]),"read real replay trace and validate native metadata");
+        for(unsigned i=0;i<8;++i) {
+            char fallback[16];printf("P%u=%s\n",i+1,observerName(i,fallback));
+        }
+        return 0;
+    }
     unsigned char nameSelf[0x520]{},nameStorage[80]{};
     char* nameText=(char*)nameStorage+16;
     strcpy_s(nameText,64,"TestUser_2");*(int*)(nameText-12)=10;
@@ -167,6 +278,25 @@ int main() {
     savedNames=namesFixture;char nameFallback[16];
     require(!strcmp(observerName(0,nameFallback),"TestUser_2") && !strcmp(observerName(1,nameFallback),"P2"),"display captured names and preserve legacy fallback");
     savedNames={1,{}};
+    {
+        PlayerNames recorded{1,{}};strcpy_s(recorded.names[0],"James");strcpy_s(recorded.names[1],"yunin");
+        require(loadRecordedNames((const unsigned char*)&recorded,sizeof(recorded)),"reload match-start recorded names after previous display state was cleared");
+        char fallback[16];require(!strcmp(observerName(0,fallback),"James") && !strcmp(observerName(1,fallback),"yunin"),"recorded names replace P1/P2 in resource rows");
+        require(!loadRecordedNames((const unsigned char*)&recorded,sizeof(recorded)-1),"reject truncated names without replacing valid display names");
+        savedNames={1,{}};
+    }
+    {
+        unsigned char app[0x200]{};playback=true;terminal.store(true);failed.store(false);notice.store(10);playbackResultsStarted=false;
+        require(beginReplayResults(app,(ChangeState)fakeResultTransition) && *(uint32_t*)(app+0x128)==16 && resultTransitions==1,"verified final replay enters native result state on next application frame");
+        require(beginReplayResults(app,(ChangeState)fakeResultTransition) && resultTransitions==1,"result UI opens once without repeated reconstruction");
+        failed.store(true);playbackResultsStarted=false;
+        require(!beginReplayResults(app,(ChangeState)fakeResultTransition) && resultTransitions==1,"desync never presented as completed match results");
+        failed.store(false);notice.store(14);
+        require(!beginReplayResults(app,(ChangeState)fakeResultTransition),"unsupported initialization retains failure notice");
+        notice.store(10);terminal.store(false);
+        require(!beginReplayResults(app,(ChangeState)fakeResultTransition),"in-progress replay never opens results");
+        playback=false;notice.store(0);playbackResultsStarted=false;
+    }
     State counterActual{20,63084912,18,64821323},counterAfter{20,63084912,24,64821329};
     CommandHeader counterExpected{20,63084912,24,12};
     require(bootstrapCounterOnly(counterActual,counterExpected,counterAfter),"allow only bootstrap diagnostic counter difference");
@@ -202,6 +332,179 @@ int main() {
     base=(uintptr_t)VirtualAlloc(nullptr,0x882000,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
     require(base!=0,"fixture memory");
     textBase=base;textSize=0x882000;expectedText.resize(textSize);
+    {
+        minimapAlarmBlit=fakeAlarmBlit;playback=true;active=true;
+        replayMinimapAlarmBlit(nullptr,nullptr,0,0,0);
+        require(alarmBlits==0,"replay minimap alarm pixels suppressed without skipping renderer lifecycle");
+        active=false;replayMinimapAlarmBlit(nullptr,nullptr,0,0,0);
+        playback=false;active=true;replayMinimapAlarmBlit(nullptr,nullptr,0,0,0);
+        require(alarmBlits==2,"minimap alarms forwarded outside active playback");
+        active=false;minimapAlarmBlit=nullptr;
+    }
+    {
+        playback=true;active=true;terminal.store(true);failed.store(false);playbackResultsStarted=true;resultButton=(ResultButton)fakeResultButton;
+        for(uint32_t button=700;button<704;++button)
+            require(resultButtonHook(nullptr,nullptr,button)==button+1000 && resultButtonValue==button,"native unit/building/resource/total statistic buttons preserved");
+        require(resultButtons==4 && resultButtonHook(nullptr,nullptr,704)==1 && resultButtons==4 && playbackExitRequested,"result confirm bypasses absent lobby and requests process shutdown");
+        MSG message{};PeekMessageW(&message,nullptr,WM_QUIT,WM_QUIT,PM_REMOVE);
+        playbackExitRequested=false;playbackResultsStarted=false;terminal.store(false);resultButton=nullptr;
+        showHeroPanel=true;recordingWindowProc(nullptr,WM_KEYDOWN,'H',0);require(!showHeroPanel,"H hides hero panel");
+        recordingWindowProc(nullptr,WM_KEYDOWN,'H',0);require(showHeroPanel,"H restores hero panel");
+        require(observerHeroName(30) && observerHeroName(105) && observerHeroName(106) && observerHeroName(111) && observerHeroName(108) && !observerHeroName(24),"requested hero catalogue includes campaign heroes and excludes ordinary Lich");
+        unsigned char object[0x1600]{},sprite[0x98]{};
+        *(void**)(object+0x84)=sprite;*(int16_t*)(object+4)=55;*(int*)(object+0x18)=600;*(int*)(object+0x1c)=700;at<int16_t>(0xb36338+55*2)=80;
+        prepareObserverBuildingRing(object,(SpriteFrame)fakeBuildingRingFrame);
+        require(ringFrame==121 && *(int16_t*)(sprite+0xc)==600 && *(int16_t*)(sprite+0xe)==700 && *(int*)(sprite+0x28)==1,"building selection ring prepares native frame and world position missing from draw-only flags");
+        auto manager=(unsigned char*)VirtualAlloc(nullptr,0x34000,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+        auto definitions=(unsigned char*)VirtualAlloc(nullptr,116*0xaf8,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+        unsigned char commands[0x400]{};
+        require(manager && definitions,"upgrade fixtures allocated");
+        at<void*>(0xb870c0)=manager;*(void**)(manager+0x2c38)=object;*(uint32_t*)(manager+0xdc38)=1;*(uint32_t*)(manager+0xdc3c)=0;*(uint32_t*)(manager+0xdc4c)=11264;
+        at<void*>(0xb870f4)=definitions;at<void*>(0xb82824)=commands;
+        *(int*)(definitions+55*0xaf8+0xa9c)=1;*(int*)(definitions+55*0xaf8+0xaa8)=1;
+        *(int*)(commands+0x204)=90;*(int*)(commands+0x208)=500;*(int*)(commands+0x20c)=5;
+        require(observerResearchIcon(object,5)==90 && observerResearchIcon(object,6)==-1,"upgrade icon comes from matching native command definition, not guessed frame number");
+        *(int16_t*)(object+6)=1;*(int16_t*)(object+8)=0;*(int16_t*)(object+0x12e)=5;*(int16_t*)(object+0x1488)=1;
+        *(int16_t*)(object+0x1484)=200;*(int16_t*)(object+0x1486)=1000;
+        producer=GetCurrentThreadId();at<uint32_t>(0xb3bae8)=30;at<uint32_t>(0xb8a280)=100;
+        researchProgress=(Process)fakeResearchStep;resetObserverExtras();
+        require(!observerUpgradeNearEnd(167,30) && observerUpgradeNearEnd(166,30) && !observerUpgradeNearEnd(1,0),"five-second warning follows simulation tick duration");
+        researchProgressHook(object,nullptr);require(!observerUpgrades[0].object,"no premature upgrade warning");
+        *(int16_t*)(object+0x1484)=167;researchProgressHook(object,nullptr);
+        require(observerUpgrades[0].object==object && observerUpgrades[0].remaining==166 && observerUpgrades[0].icon==90 && !observerUpgrades[0].completed,"countdown appears at five seconds with correct upgrade icon");
+        *(int16_t*)(object+0x1484)=1;researchProgressHook(object,nullptr);
+        require(observerUpgrades[0].completed && observerUpgrades[0].completedAt==100,"completion effect requires native research completion transition");
+        bool wasParticipant=observerPlayers[0].participant;observerPlayers[0].participant=true;
+        *(int16_t*)(object+6)=0;*(uint16_t*)(object+0x14)=100;
+        *(int16_t*)(object+0x1a8)=5;*(int16_t*)(object+0x1aa)=20;
+        *(int*)(object+0x35c)=99; // Unrelated unit field: old code read this.
+        for(int heroType:{105,108}) {
+            *(int16_t*)(object+4)=(int16_t)heroType;observerHeroCount=0;refreshObserverHeroes();
+            require(observerHeroCount==1 && observerHeroes[0].level==5,"Russelaunt and Lauriana show native base level five rather than information-panel cache offset");
+        }
+        *(int16_t*)(object+0x1a8)=7;observerHeroCount=0;refreshObserverHeroes();
+        require(observerHeroes[0].level==7,"hero level-up uses live WORD level without fixed base-level override or adjacent field contamination");
+        observerPlayers[0].participant=wasParticipant;
+        resetObserverExtras();researchProgress=nullptr;producer=0;playback=false;active=false;
+        at<void*>(0xb870c0)=nullptr;at<void*>(0xb870f4)=nullptr;at<void*>(0xb82824)=nullptr;
+        VirtualFree(manager,0,MEM_RELEASE);VirtualFree(definitions,0,MEM_RELEASE);
+    }
+    {
+        unsigned char resource[0x1600]{},game[0x700]{},ui[sizeof(observerPanel)]{},player[16]{};
+        auto manager=(unsigned char*)VirtualAlloc(nullptr,0x34000,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+        require(manager!=nullptr,"resource manager fixture");
+        at<void*>(0xb870c0)=manager;*(void**)(manager+0x2c38)=resource;
+        *(int16_t*)(resource+6)=1;*(int16_t*)(resource+8)=10;*(int*)(resource+0x14f8)=12500;
+        for(uint32_t table:{0xa3db54u,0xa3d9c4u,0xa3dce4u}) {
+            *(void**)resource=address(table);require(observerInspectable(resource),"all three neutral resource classes remain inspectable with zero HP");
+        }
+        *(int16_t*)(resource+0x4c)=1;require(!observerInspectable(resource),"removed resource not selectable");*(int16_t*)(resource+0x4c)=0;
+        *(void**)resource=address(0xa2b5fc);require(!observerInspectable(resource),"neutral non-resource objects cannot bypass participant ownership validation");
+        *(void**)resource=address(0xa3db54);at<void*>(0xb8282c)=game;*(uint32_t*)(game+0x664)=2;*(void**)(game+0x50)=player;
+        void* table[5]{};table[4]=(void*)fakeResourcePanel;*(void**)ui=table;*(void**)(ui+0x23c)=player;expectedPanelPlayer=player;
+        playback=true;active=true;showObserverHud=true;observerSelected=0;observerPanelUnavailable=false;observerPanelSource=nullptr;
+        unsigned char savedResource[sizeof(resource)];memcpy(savedResource,resource,sizeof(resource));
+        require(observerPanelHook(ui,nullptr)==654 && *(uint32_t*)(game+0x664)==2 && !observerPanelDrawing && !memcmp(resource,savedResource,sizeof(resource)),"neutral resource panel receives selected object without switching to neutral owner or changing remaining amount/HP");
+        *(int*)(resource+0x14f8)=12000;require(observerInspectable(resource),"decreasing resource amount remains live inspectable data");
+        observerSelected=-1;observerPanelSource=nullptr;panelSelected=-2;expectedPanelPlayer=nullptr;playback=false;active=false;
+        at<void*>(0xb8282c)=nullptr;at<void*>(0xb870c0)=nullptr;VirtualFree(manager,0,MEM_RELEASE);
+    }
+    {
+        require(observerRaceInitial(1000)=='H' && observerRaceInitial(2000)=='D' && observerRaceInitial(3000)=='?',"race initials use actual Human/Devil enums");
+        at<int>(0xbf281c)=0x10000;at<uint16_t>(0xbea784)=0xda04;
+        at<uint16_t>(0xbea770)=0x6e04;
+        char colored[64];observerColoredName("James",0,colored);
+        require(!strcmp(colored,"\\cDA04James"),"ID queues a private 565 marker consumed before native palette indexing");
+        observerColoredName("a\\1b",0,colored);
+        require(!strcmp(colored,"\\cDA04a\\\\1b"),"player ID cannot inject native font markup");
+        at<int>(0xbf281c)=0x8000;observerColoredName("James",0,colored);
+        require(!strcmp(colored,"\\c6E04James"),"ID follows native 555 player palette");
+        require(observerPlayerColor(-1)==0x7fff,"invalid color has safe white fallback");
+        require(observerTint(0xffff,0xda04,false)==0xda04 && observerTint(0,0xda04,false)==0,"565 tint preserves foreground hue and black outline");
+        require(observerTint(0x7fff,0x6e04,true)==0x6e04,"555 tint uses correct channel masks");
+        std::vector<uint16_t> tintedGlyph;
+        const uint16_t glyph[]={9,0x02f8,0xffff,0x0000,0x81f8,0xffff,0x0100,0x0000,0xffff};
+        require(tintObserverGlyph(glyph,1,0xda04,false,tintedGlyph) && tintedGlyph[2]==0xda04 && tintedGlyph[3]==0 && tintedGlyph[5]==0xda04 && tintedGlyph[1]==0x02f8 && tintedGlyph[6]==0x0100 && glyph[2]==0xffff,"bitmap ID tint recolors literal/repeated glyph pixels, retains outline/alpha/transparency and original asset");
+        const uint16_t malformedGlyph[]={3,0x05f8,0xffff};
+        require(!tintObserverGlyph(malformedGlyph,1,0xda04,false,tintedGlyph) && !tintObserverGlyph(glyph,129,0xda04,false,tintedGlyph),"glyph tint rejects invalid run bounds and excessive dimensions");
+        unsigned char font[0xa0]{},assets[0x120]{};uint16_t palette[32]{};palette[1]=0x7fff;
+        *(void**)font=assets;*(void**)(assets+0xf0)=palette;*(uint16_t*)(font+0x46)=0x1234;
+        at<int>(0xb40d64)=1;
+        playback=true;active=true;producer=GetCurrentThreadId();
+        savedNames={1,{}};strcpy_s(savedNames.names[0],"James");observerPlayers[0].participant=true;observerPlayers[0].color=0;
+        textDraw=(TextDraw)fakeTextDraw;textExpectTint=true;
+        require(observerTextDrawHook(font,nullptr,colored,(void*)0x1234,23,240,30,0)==456 && !*(uint32_t*)(font+0x40) && *(uint16_t*)(font+0x46)==0x1234,"queued ID applies player palette at actual draw and restores font palette");
+        require(textExceptionRestored(font,colored),"font override restored after draw exception");
+        *(int*)(font+0x84)=4;at<int>(0xb40d64+16)=2;
+        require(observerTextDrawHook(font,nullptr,colored,(void*)0x1234,23,240,30,0)==456 && !*(uint32_t*)(font+0x40) && *(uint16_t*)(font+0x46)==0x1234,"actual face 4 GDI foreground uses player RGB despite direct-color bitmap fallback");
+        require(textExceptionRestored(font,colored),"face 4 palette and tint context restored on exception");
+        *(int*)(font+0x84)=0;
+        textExpectTint=false;playback=false;uint16_t tint;
+        require(!observerIdText(colored,tint) && observerTextDrawHook(font,nullptr,"Gold",(void*)0x1234,23,240,30,0)==456,"normal game and unrelated text use original draw");
+        savedNames={1,{}};observerPlayers[0].participant=false;textDraw=nullptr;
+        unsigned char building[0x1500]{};*(uint16_t*)(building+0x14)=100;
+        playback=true;active=true;producer=GetCurrentThreadId();displayDepth=0;
+        require(observerMinimapBuildingVisible(building,nullptr)==0,"outside display retains original building visibility test");
+        require(minimapFlagsPreserveRegisters(building,false),"minimap comparison thunk preserves registers and hidden ZF");
+        displayDepth=1;
+        require(observerMinimapBuildingVisible(building,nullptr)==1 && *(uint16_t*)(building+0x14)==100 && !building[0x14e8],"observer minimap includes unknown enemy building without changing HP or remembered visibility");
+        require(minimapFlagsPreserveRegisters(building,true),"minimap comparison thunk preserves registers and visible ZF");
+        playback=false;
+        require(observerMinimapBuildingVisible(building,nullptr)==0,"normal gameplay retains minimap restrictions even inside display");
+        building[0x14e8]=1;
+        require(observerMinimapBuildingVisible(building,nullptr)==1,"normal known building visibility remains intact");
+        active=false;displayDepth=0;producer=0;
+    }
+    {
+        unsigned char worker[0x80]{};*(uint16_t*)(worker+0x14)=100;worker[0x67]=1;
+        require(liveObserverWorker(worker),"alive worker remains counted despite auxiliary visibility/storage flag");
+        *(int16_t*)(worker+4)=15;require(liveObserverWorker(worker),"Devil worker counted alongside Human worker");
+        *(uint16_t*)(worker+0x14)=0;require(!liveObserverWorker(worker),"dead worker excluded");
+        *(uint16_t*)(worker+0x14)=100;*(int16_t*)(worker+6)=1;require(!liveObserverWorker(worker),"buildings never counted as workers");
+        unsigned char building[0x1500]{};building[0x6b]=1;building[0x69]=1;
+        playback=true;active=true;producer=GetCurrentThreadId();at<unsigned char>(0xb3ba61)=0;
+        require(observerObjectDisplay(building,(Process)fakeObserverDraw)==321 && building[0x6b]==1 && building[0x69]==1,"unscouted building actual sprite draw is visible then fog/detection restored");
+        require(buildingExceptionRestored(building),"building display restores flags on exceptional exit");
+        *(int16_t*)(building+6)=1;*(uint16_t*)(building+0x14)=100;
+        *(int16_t*)(building+0x14a6)=3;building[0x14d9]=0;
+        require(observerObjectDisplay(building,(Process)fakeObserverDraw)==321 && !building[0x14d9] && !building[0x14d8] && *(int16_t*)(building+0x14a6)==3,"unscouted construction uses scaffolding draw gate without painting a completed body or changing stage");
+        require(buildingExceptionRestored(building) && !building[0x14d9],"construction draw gate restored on exception");
+        auto manager=(unsigned char*)VirtualAlloc(nullptr,0x34000,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+        require(manager!=nullptr,"building preparation manager fixture");
+        at<void*>(0xb870c0)=manager;*(uint32_t*)(manager+0xdc38)=1;*(uint32_t*)(manager+0xdc3c)=0;
+        *(void**)(manager+0x2c38)=building;*(uint32_t*)(manager+0xdc4c)=11264;
+        building[0x4e]=7;building[0x4f]=9;building[0x3d]=5;observerSelected=0;expectSelectionRing=true;
+        require(observerObjectDisplay(building,(Process)fakeSelectionRingDraw)==987 && building[0x4e]==7 && building[0x4f]==9,"observer-selected enemy building gets native circle only while drawn then restores original selection");
+        *(int16_t*)(building+6)=0;
+        require(observerObjectDisplay(building,(Process)fakeSelectionRingDraw)==987 && building[0x4e]==7 && building[0x4f]==9,"observer-selected enemy unit gets circle without changing player selection state");
+        require(selectionRingExceptionRestored(building),"both selection display flags restored after exceptional draw");
+        observerSelected=-1;expectSelectionRing=false;
+        require(observerObjectDisplay(building,(Process)fakeSelectionRingDraw)==987 && building[0x4e]==7 && building[0x4f]==9,"deselection removes observer ring and does not leak recorded selection");
+        observerSelected=0;*(uint16_t*)(building+0x14)=0;
+        require(observerObjectDisplay(building,(Process)fakeSelectionRingDraw)==987,"dead selected object never draws selection circle");
+        observerSelected=-1;*(uint16_t*)(building+0x14)=100;*(int16_t*)(building+6)=1;
+        building[0x4e]=0;building[0x4f]=0;building[0x3d]=0;
+        buildingBodyPrepare=(Process)fakeBuildingBody;
+        require(observerDisplay(building,(Process)fakeObserverDraw)==321 && bodyPrepares==0 && !building[0x14d9],"prepare pass keeps under-construction body absent and restores visibility");
+        *(int16_t*)(building+0x14a6)=0;
+        require(observerDisplay(building,(Process)fakeObserverDraw)==321 && bodyPrepares==1 && building[0x14d8]==1 && !building[0x14d9] && !building[0x14e8] && *(uint16_t*)(building+0x14)==100,"completion prepares native graphics once without marking building explored or changing HP");
+        observerDisplay(building,(Process)fakeObserverDraw);require(bodyPrepares==1,"completed graphics not regenerated each frame");
+        building[0x14d8]=0;*(uint16_t*)(building+0xc)=0x3e80;
+        require(!observerNeedsBuildingBody(building),"destroyed native state never prepared as finished building");
+        *(uint16_t*)(building+0xc)=0;inDispatch=true;displayDepth=1;
+        prepareObserverBuildingBody(building,(Process)fakeBuildingBody);require(bodyPrepares==1,"building graphics never initialized during simulation dispatch");
+        inDispatch=false;displayDepth=0;buildingBodyPrepare=nullptr;at<void*>(0xb870c0)=nullptr;VirtualFree(manager,0,MEM_RELEASE);
+        *(int16_t*)(building+6)=0;
+        characterRender=(Process)fakeObserverDraw;
+        building[0x3c]=1;*(int16_t*)(building+8)=7;
+        require(characterRenderHook(building,nullptr)==321 && building[0x69]==1 && building[0x6b]==1 && building[0x3c]==1 && *(int16_t*)(building+8)==7,"opponent cloaked character actual draw reveals then restores detection without changing owner/culling");
+        characterRender=(Process)fakeObserverThrow;
+        require(buildingExceptionRestored(building),"character shared display scope restores detection on exception");
+        characterRender=nullptr;
+
+        require(observerDisplay(building,(Process)fakeMinimapProduce)==777 && displayDepth==0 && at<unsigned char>(0xb3ba61)==0,"minimap producer has explicit observer scope and restores it");
+        playback=false;active=false;producer=0;
+    }
     playback=false;
     {
         unsigned char dyingUnit[0x80]{},playerAudio[0x600]{};
@@ -216,6 +519,9 @@ int main() {
         unsigned char savedPlayer[sizeof(playerAudio)];memcpy(savedPlayer,playerAudio,sizeof(playerAudio));
         require(replayUnitAudio(playerAudio,(UnitAudio)fakeUnitAudio,dyingUnit,4,0)==123,"observer hears remote owner's death without native ownership or speech gate");
         require(deathSound==2509 && deathArchive==0x22220000 && unitAudioCalls==0,"death sound keeps original speech archive containing pe109.wav and skips unavailable variant");
+        uint32_t previousVoiceCalls=voiceLoadCalls;
+        require(replayVoice(playerAudio,(VoiceAudio)fakeVoiceArchive,2509,0x22220000,0)==0x22220000 && voiceLoadCalls==previousVoiceCalls+1,"known death voice survives generic speech mute call sites with original resource archive");
+        require(replayVoice(playerAudio,(VoiceAudio)fakeVoiceArchive,2502,0x22220000,0)==0xffffffffu && voiceLoadCalls==previousVoiceCalls+1,"selection dialogue remains muted while death voices are allowed");
         require(!memcmp(savedPlayer,playerAudio,sizeof(playerAudio)) && at<uint32_t>(0xb3e648)==777 && at<uint32_t>(0xbed1e8)==888,"death playback preserves player caches and both RNG states");
         require(replayUnitAudio(playerAudio,(UnitAudio)fakeUnitAudio,dyingUnit,1,0)==99,"non-death response retains native handling");
         playback=false;
@@ -249,7 +555,7 @@ int main() {
     ring=(unsigned char*)VirtualAlloc(nullptr,RingSize,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
     require(ring!=nullptr,"ring memory");
     {
-        unsigned char trackManager[0x2c3c]{},trackGame[0xa00]{},trackUnit[0x80]{},replacementUnit[0x80]{};
+        unsigned char trackManager[0x2c40]{},trackGame[0xa00]{},trackUnit[0x80]{},replacementUnit[0x80]{};
         at<void*>(0xb870c0)=trackManager;*(unsigned char**)(trackManager+0x2c38)=trackUnit;
         *(uint16_t*)(trackUnit+0x14)=100;*(int16_t*)(trackUnit+8)=2;
         *(int*)(trackUnit+0x18)=1500;*(int*)(trackUnit+0x1c)=1400;
@@ -277,13 +583,45 @@ int main() {
         updateObserverTracking(trackGame);
         require(at<int>(0xb869c4)==1300,"tracking centers against expanded hidden-HUD viewport");
         showObserverHud=true;
-        toggleObserverTracking();require(observerTracked==-1,"tracking toggles off");
+        *(unsigned char**)(trackManager+0x2c3c)=replacementUnit;
+        *(uint16_t*)(replacementUnit+0x14)=100;
+        *(int*)(replacementUnit+0x18)=2700;*(int*)(replacementUnit+0x1c)=2400;
+        observerSelected=1;
+        synchronizeObserverCamera(trackGame);
+        int releasedX=at<int>(0xb869c4),releasedY=at<int>(0xb869c8);
+        toggleObserverTracking();require(observerTracked==-1 && !observerTrackedObject,"tracking release stops even after selecting a different live unit");
+        *(int*)(trackUnit+0x18)=2000;updateObserverTracking(trackGame);
+        require(at<int>(0xb869c4)==releasedX && at<int>(0xb869c8)==releasedY,"released camera stays at its current location and follows neither unit");
+        unsigned char nativePlayer[0x1760]{};*(int16_t*)(nativePlayer+0x170c)=1;
+        cameraInput=(CameraInput)fakeCameraInput;DWORD oldProducer=producer;producer=GetCurrentThreadId();
+        observerCameraInputHook(nativePlayer,nullptr);
+        require(at<int>(0xb869c4)==releasedX+7 && *(int16_t*)(nativePlayer+0x170c)==1,"recorded selection cannot retarget camera, manual scroll and player selection preserved");
+        at<int>(0xb869c8)=9000;synchronizeObserverCamera(trackGame);
+        require(at<int>(0xb869c4)==releasedX && at<int>(0xb869c8)==releasedY && *(int*)(trackGame+0x9c4)==releasedX && terrainOrigin[0]==releasedX,"release frame restores last displayed position across native camera and renderer caches");
+        observerCameraInputHook(nativePlayer,nullptr);synchronizeObserverCamera(trackGame);
+        require(at<int>(0xb869c4)==releasedX+7,"manual scrolling resumes after one release frame without recorded-unit tracking");
+        require(cameraSelectionRestoredOnException(nativePlayer),"native selection count restored on exceptional camera exit");
+        producer=oldProducer;cameraInput=nullptr;
+        observerSelected=0;
         toggleObserverTracking();*(uint16_t*)(trackUnit+0x14)=0;updateObserverTracking(trackGame);
         require(observerTracked==-1,"tracking stops for dead unit");
         *(uint16_t*)(trackUnit+0x14)=100;toggleObserverTracking();
         *(unsigned char**)(trackManager+0x2c38)=replacementUnit;updateObserverTracking(trackGame);
         require(observerTracked==-1,"tracking stops when target slot changes object");
         *(unsigned char**)(trackManager+0x2c38)=trackUnit;
+        *(int16_t*)(trackUnit+4)=30;*(uint16_t*)(trackUnit+0x14)=100;
+        observerHeroHitCount=1;observerHeroHits[0]={{12,405,66,459},0,2,30,trackUnit};
+        showHeroPanel=true;showObserverHud=true;at<void*>(0xb8282c)=trackGame;
+        stopObserverTracking();
+        require(clickObserverHero(20,420) && observerTracked==0 && observerSelected==0 && at<int>(0xb869c4)==1600,"portrait click selects and centers that hero for tracking");
+        require(clickObserverHero(20,420) && observerTracked==0,"clicking tracked hero portrait keeps tracking instead of toggling off");
+        showHeroPanel=false;require(!clickObserverHero(20,420),"H-hidden portrait cannot intercept terrain clicks");showHeroPanel=true;
+        showObserverHud=false;require(!clickObserverHero(20,420),"U-hidden portrait cannot intercept terrain clicks");showObserverHud=true;
+        stopObserverTracking();*(unsigned char**)(trackManager+0x2c38)=replacementUnit;
+        require(clickObserverHero(20,420) && observerTracked==-1,"stale portrait cannot follow replacement object in recycled slot");
+        *(unsigned char**)(trackManager+0x2c38)=trackUnit;*(uint16_t*)(trackUnit+0x14)=0;
+        require(clickObserverHero(20,420) && observerTracked==-1,"dead hero portrait cannot start tracking");
+        *(uint16_t*)(trackUnit+0x14)=100;observerHeroHitCount=0;at<void*>(0xb8282c)=nullptr;
         *(void**)trackUnit=address(0xa2b7dc);
         require(observerUnit(0)==nullptr,"fog proxy is never treated as full gameplay unit");
         toggleObserverTracking();require(observerTracked==-1,"fog proxy cannot enter observer tracking");
@@ -329,6 +667,9 @@ int main() {
     *(int*)(self+0x9c4)=700;*(int*)(self+0x9c8)=800;
     require(observerAudio(self,(Audio)fakeAudio,1,2,1000,100,5)==8 && observerAudioDepth==0 && at<int>(0xbf2588)==866,"spatial audio uses full hidden-HUD viewport with scoped visibility");
     require(at<int>(0xb869c4)==1300 && at<int>(0xb869c8)==1400,"audio restores simulation camera after playback");
+    auto mixer=address(0x700000);observerMixerWidth=0;
+    require(observerAudioUpdate(mixer,(Process)fakeMixerUpdate)==876,"continuous mixer follows rendered camera and hidden-HUD viewport, invalidating width cache");
+    require(at<int>(0xbf2588)==866 && at<int>(0xb869c4)==1300 && at<int>(0xb869c8)==1400,"mixer update restores shared viewport and camera");
     require(audioExceptionRestored(self) && at<int>(0xb869c4)==1300 && at<int>(0xb869c8)==1400,"audio exception restores camera, width and visibility scope");
     showObserverHud=true;observerHudRedrawFrames=0;
     toggleObserverHud();require(!showObserverHud && !observerHudRedrawFrames,"hide HUD cancels pending full redraw");
@@ -489,6 +830,24 @@ int main() {
     require(!memcmp(call,expectedText.data()+((uintptr_t)call-textBase),5),"own patches included in runtime verification");
     restore();require(!memcmp(call,original,5),"restore exact owned bytes");
     call[0]=0x90;require(!patchCall(0x4cfc55,0x4daf50,(void*)advanceHook),"reject unexpected instruction bytes");
+    // Population belongs to writer metadata, with ordinals across every command.
+    resetState();playback=false;active=true;inDispatch=true;head.store(0);tail.store(0);
+    producer=GetCurrentThreadId();populationOrdinal=0;populationSamples=0;initial.state.tick=100;at<uint32_t>(0xb8a280)=101;
+    unsigned char populationPlayer[0xe30]{};*(int*)(populationPlayer+0xe24)=12;
+    ((void**)(self+48))[0]=populationPlayer;
+    auto capacityStub=(unsigned char*)address(0x522760);
+    const unsigned char returnTen[]={0xb8,10,0,0,0,0xc3};memcpy(capacityStub,returnTen,sizeof(returnTen));
+    uint32_t otherOrder=5;commandHook(self,nullptr,4,&otherOrder);
+    uint16_t productionOrder[4]={400,0,0,0};commandHook(self,nullptr,8,productionOrder);
+    uint32_t position=0;PopulationSample sample{};bool foundPopulation=false;
+    while(position<head.load()) {
+        Record r{};readRing(position,&r,sizeof(r));
+        if(r.kind==Population) {readRing(position+sizeof(r),&sample,sizeof(sample));foundPopulation=true;}
+        position+=sizeof(r)+r.size;
+    }
+    require(foundPopulation && sample.ordinal==1 && sample.tick==101 && sample.player==0 && sample.used==12 && sample.capacity==10,"opening supply captures correct command ordinal, owner and actual over-cap population");
+    require(*(int*)(populationPlayer+0xe24)==12,"population metadata does not modify player state");
+    active=false;inDispatch=false;((void**)(self+48))[0]=nullptr;
     printf("NATIVE_ENGINE_TESTS_PASS: capture/replay, live-input separation, RNG/state mismatch, overflow, patch integrity/restoration\n");
     return 0;
 }
