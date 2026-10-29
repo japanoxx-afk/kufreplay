@@ -27,6 +27,13 @@ std::vector<ReplayCommand> replayBatch;
 size_t replayPop=0,replayApply=0;
 uint32_t session=0,frames=0;
 uint32_t populationOrdinal=0,populationSamples=0;
+std::atomic<uint32_t> populationReadFailures{0};
+struct NativeSyncDiagnostic {
+    uint32_t tick,seed,randomCount,localPlayer;
+    uint32_t reportTicks[10],checksums[10],startupChecksums[10];
+};
+NativeSyncDiagnostic nativeSyncDiagnostic{};
+std::atomic<bool> nativeSyncReady{false};
 Initial initial{};
 State lastBefore{};
 Initial savedInitial{};
@@ -119,11 +126,23 @@ bool showResources=true,showObserverHud=true,showReplayTime=true;
 unsigned observerHudRedrawFrames=0;
 void toggleObserverHud() {
     showObserverHud=!showObserverHud;
-    // Refresh all retained sprite surfaces across the display buffer cycle.
+    // Refresh retained HUD surfaces across the display buffer cycle.
     observerHudRedrawFrames=showObserverHud?3:0;
 }
+bool observerHudSurface(void* surface) {
+    auto game=(unsigned char*)at<void*>(0xb8282c);
+    if(!game || !surface) return false;
+    // Exactly the player UI surfaces skipped by observerLayerHook while hidden.
+    // World/effect renderers keep drawing throughout HUD hiding and need no rebuild.
+    for(unsigned i=0;i<8;++i) {
+        auto player=((unsigned char**)(game+0x48))[i];
+        auto ui=player?*(unsigned char**)(player+0x5e0):nullptr;
+        if(ui && *(void**)(ui+0x10)==surface) return true;
+    }
+    return false;
+}
 uint32_t redrawObserverSurface(void* self,Process original,Process fullDraw) {
-    return playback && active && showObserverHud && observerHudRedrawFrames?fullDraw(self):original(self);
+    return playback && active && showObserverHud && observerHudRedrawFrames && observerHudSurface(self)?fullDraw(self):original(self);
 }
 unsigned replaySpeed=1;
 uint32_t clockWall=0,clockValue=0,clockTarget=0;
@@ -541,12 +560,7 @@ uint32_t __fastcall observerLayerHook(void* self,void*) {
     if(playback && active && !showObserverHud) {
         if(original==(Process)address(0x6819e0)) return drawExpandedTerrain(self,original);
         if(original==(Process)address(0x4b3ff0) || original==(Process)address(0x505100)) return 1;
-        auto game=(unsigned char*)at<void*>(0xb8282c);
-        if(game) for(unsigned i=0;i<8;++i) {
-            auto player=((unsigned char**)(game+0x48))[i];
-            auto ui=player?*(unsigned char**)(player+0x5e0):nullptr;
-            if(ui && *(void**)(ui+0x10)==self) return 1;
-        }
+        if(observerHudSurface(self)) return 1;
     }
     return original(self);
 }
@@ -1216,6 +1230,11 @@ bool observerTrackingShortcut(WPARAM key, SHORT controlState, LPARAM flags) {
 }
 
 LRESULT CALLBACK recordingWindowProc(HWND window,UINT message,WPARAM wparam,LPARAM lparam) {
+    // Native Ctrl+F5 reloads a saved game outside the recorded command stream.
+    // Consume F5 even before map activation and after Ctrl is released, including
+    // repeats/system-key messages. Recording and normal play retain native input.
+    if(playback && wparam==VK_F5 && (message==WM_KEYDOWN || message==WM_KEYUP ||
+       message==WM_SYSKEYDOWN || message==WM_SYSKEYUP)) return 0;
     if(playback && active && wparam=='C' && (message==WM_KEYDOWN || message==WM_KEYUP)) {
         if(message==WM_KEYDOWN && observerTrackingShortcut(wparam,GetKeyState(VK_CONTROL),lparam)) toggleObserverTracking();
         return 0;
@@ -1279,6 +1298,53 @@ bool bootstrapCounterOnly(const State& actual,const CommandHeader& expected,cons
         actual.checksum-actual.randomCount==after.checksum-after.randomCount;
 }
 
+bool capturePopulation(void* self,unsigned owner,int& used,int& capacity) {
+    // Verified CGame::GetPlayer 4c6f40 and native checksum 4dae50 use +0x48.
+    // +48 (decimal, 0x30) instead aliases map pointers/dimensions and can fault
+    // before the original command is applied. Optional metadata must not do so.
+    if(!self || owner>=8) return false;
+    __try {
+        auto player=((unsigned char**)((unsigned char*)self+0x48))[owner];
+        if(!player) return false;
+        used=*(int*)(player+0xe24);
+        int raw=*(int*)(player+0xe28),bonus=*(int*)(player+0xe2c);
+        // Read-only equivalent of 522760 / 4319a0(15), without invoking game
+        // functions from inside command recording. Preserve over-cap usage.
+        int limit=270;uint16_t scenario=at<uint16_t>(0xb83ad2);
+        if(scenario==1) limit=400;
+        else if(scenario==0) {
+            auto game=(unsigned char*)at<void*>(0xb8282c);
+            if(game?*(signed char*)(game+0xc79)>=2:at<unsigned char>(0xb8271c)!=0) limit=300;
+        }
+        int64_t total=(int64_t)std::min(raw,limit)+bonus;
+        if(used<0 || used>1000000 || raw<0 || bonus<0 || total<0 || total>1000000) return false;
+        capacity=(int)total;return true;
+    } __except(GetExceptionCode()==EXCEPTION_ACCESS_VIOLATION?EXCEPTION_EXECUTE_HANDLER:EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+
+void observeRecordingSync(void* self) {
+    if(playback || nativeSyncReady.load(std::memory_order_relaxed) || !self) return;
+    __try {
+        auto game=(unsigned char*)self;
+        // 4db540..4db699 compares peer reports for the same tick and sets +46c
+        // on mismatch. Observe only; never suppress native synchronization.
+        if(at<unsigned char>(0xb83ad0)!=1 || !game[0x46c]) return;
+        NativeSyncDiagnostic value{};
+        value.tick=at<uint32_t>(0xb8a280);value.seed=at<uint32_t>(0xbed1e8);
+        value.randomCount=at<uint32_t>(0xb827dc);value.localPlayer=*(uint32_t*)(game+0x664);
+        memcpy(value.reportTicks,game+0x3e4,sizeof(value.reportTicks));
+        memcpy(value.checksums,game+0x410,sizeof(value.checksums));
+        memcpy(value.startupChecksums,game+0x440,sizeof(value.startupChecksums));
+        nativeSyncDiagnostic=value;nativeSyncReady.store(true,std::memory_order_release);
+    } __except(GetExceptionCode()==EXCEPTION_ACCESS_VIOLATION?EXCEPTION_EXECUTE_HANDLER:EXCEPTION_CONTINUE_SEARCH) {}
+}
+uint32_t advanceNative(void* self,uint32_t a,uint32_t b) {
+    uint32_t result=advance(self,a,b);
+    observeRecordingSync(self);return result;
+}
+
 uint32_t __fastcall commandHook(void* self,void*,uint32_t length,const void* bytes) {
     if(playback && inDispatch) {
         if(failed.load() || replayApply>=replayBatch.size()) {invalidate(8);return 0;}
@@ -1307,15 +1373,11 @@ uint32_t __fastcall commandHook(void* self,void*,uint32_t length,const void* byt
                 (length==12 && (opcode==170 || opcode==5170)))) {
                 const uint16_t owner=((const uint16_t*)bytes)[1];
                 if(owner<8) {
-                    auto player=((unsigned char**)((unsigned char*)self+48))[owner];
-                    if(player) {
-                        int used=*(int*)(player+0xe24);
-                        int capacity=((int(__thiscall*)(void*))address(0x522760))(player);
-                        if(used>=0 && used<=1000000 && capacity>=0 && capacity<=1000000) {
-                            PopulationSample sample{ordinal,h.tick,owner,(uint32_t)used,(uint32_t)capacity};
-                            emit(Population,&sample,sizeof(sample));++populationSamples;
-                        }
-                    }
+                    int used=0,capacity=0;
+                    if(capturePopulation(self,owner,used,capacity)) {
+                        PopulationSample sample{ordinal,h.tick,owner,(uint32_t)used,(uint32_t)capacity};
+                        emit(Population,&sample,sizeof(sample));++populationSamples;
+                    } else populationReadFailures.fetch_add(1,std::memory_order_relaxed);
                 }
             }
         }
@@ -1391,8 +1453,8 @@ bool discardLiveQueue() {
 
 uint32_t __fastcall advanceHook(void* self,void*,uint32_t a,uint32_t b) {
     lastAdvanceAt.store(GetTickCount64());
-    if(closePending.load()) return advance(self,a,b);
-    if(failed.load()) return playback?1:advance(self,a,b);
+    if(closePending.load()) return advanceNative(self,a,b);
+    if(failed.load()) return playback?1:advanceNative(self,a,b);
     // Both native branches dispatch here after queue synchronization. The network
     // branch sorts commands by participant before calling our command hook.
     // Observe that order without replacing the network queue or changing its mode.
@@ -1400,7 +1462,7 @@ uint32_t __fastcall advanceHook(void* self,void*,uint32_t a,uint32_t b) {
     if(!playback && active && initial.networkMode!=networkMode) finish(self);
     if(networkMode>1 || (playback && networkMode!=0)) {
         if(active) {invalidate(5);active=false;}
-        return advance(self,a,b);
+        return advanceNative(self,a,b);
     }
     if(!producer) producer=GetCurrentThreadId();
     if(playback && savedInitial.networkMode==1) {
@@ -1410,7 +1472,7 @@ uint32_t __fastcall advanceHook(void* self,void*,uint32_t a,uint32_t b) {
         if(at<uint32_t>(0xb8a280)<expected) return 1;
     }
     State state{};
-    if(!snapshot(self,state)) {invalidate(3);return advance(self,a,b);}
+    if(!snapshot(self,state)) {invalidate(3);return advanceNative(self,a,b);}
     if(!active) {
         fillInitial(self,initial);
         if(playback) {
@@ -1449,7 +1511,7 @@ uint32_t __fastcall advanceHook(void* self,void*,uint32_t a,uint32_t b) {
         lastBefore=state;
         emit(Before,&state,sizeof(state));inDispatch=true;
         uint32_t result=1;
-        __try {result=advance(self,a,b);}
+        __try {result=advanceNative(self,a,b);}
         __finally {inDispatch=false;}
         if(!snapshot(self,state)) invalidate(3);
         else emit(After,&state,sizeof(state));
@@ -1912,12 +1974,26 @@ DWORD WINAPI worker(void* argument) {
     else GetEnvironmentVariableW(L"KUF_REPLAY_READY",buffer,32768);
     HANDLE event=OpenEventW(EVENT_MODIFY_STATE,FALSE,buffer);if(event) {SetEvent(event);CloseHandle(event);}
     if(!ok) return 1;
+    log("Engine revision 0.2.62: bounded population metadata; recording sync diagnostics enabled.");
     log(playback?"Playback adapter ready. Automatic single-player/network bootstrap and spectator display enabled.":"Recording adapter ready. Single-player and multiplayer capture with network bootstrap enabled.");
     HANDLE populationFile=INVALID_HANDLE_VALUE;
     HANDLE file=INVALID_HANDLE_VALUE;std::wstring partial;uint32_t fileBytes=0,number=0;
     uint32_t lastFrameOffset=0,writtenFrames=0;State writerBefore{};
     ULONGLONG checkAt=GetTickCount64(),pulseAt=0;int lastNotice=0;
+    bool syncLogged=false,populationWarningLogged=false;
     for(;;) {
+        // Only this worker writes logs. The simulation thread publishes bounded
+        // diagnostic data and continues native command/network processing.
+        if(!syncLogged && nativeSyncReady.load(std::memory_order_acquire)) {
+            syncLogged=true;const auto& d=nativeSyncDiagnostic;char line[240];
+            sprintf_s(line,"MS01 native multiplayer sync mismatch: tick=%u seed=%u RNG=%u local-player=%u",d.tick,d.seed,d.randomCount,d.localPlayer);log(line);
+            for(unsigned i=0;i<10;++i) {
+                sprintf_s(line,"MS01 peer-slot=%u report-tick=%u checksum=%u startup-checksum=%u",i,d.reportTicks[i],d.checksums[i],d.startupChecksums[i]);log(line);
+            }
+        }
+        if(!populationWarningLogged && populationReadFailures.load(std::memory_order_relaxed)) {
+            populationWarningLogged=true;log("PO02 population metadata unavailable: sample skipped; original game command still applied.");
+        }
         if(!gameWindow) {
             EnumWindows(findGameWindow,0);
             if(gameWindow) {

@@ -6,6 +6,9 @@
 
 namespace {
 uint32_t resource=100,queueCount=0,applied=0;
+unsigned forwardedHotkeys=0;
+LRESULT CALLBACK fakeHotkeyWindow(HWND,UINT,WPARAM,LPARAM) {++forwardedHotkeys;return 987;}
+
 uint32_t timerNow=100,selectionCalls=0;
 bool deferredNetworkFixture=false;
 uint32_t __stdcall fakeTimer() {return timerNow;}
@@ -22,6 +25,22 @@ uint32_t __fastcall fakeApply(void*,void*,uint32_t n,const void* bytes) {
     resource+=value;
     at<uint32_t>(0xbed1e8)=at<uint32_t>(0xbed1e8)*0x8088405+1;
     ++at<uint32_t>(0xb827dc);++applied;return 1;
+}
+unsigned productionApplyCalls=0;
+uint32_t __fastcall fakeProductionApply(void*,void*,uint32_t n,const void* bytes) {
+    ++productionApplyCalls;
+    auto order=(const uint16_t*)bytes;
+    resource+=order[0]+order[1];
+    at<uint32_t>(0xbed1e8)=at<uint32_t>(0xbed1e8)*0x8088405+1;
+    ++at<uint32_t>(0xb827dc);
+    return n+order[0]+order[1];
+}
+bool legacyPopulationReadFaults(void* self,unsigned owner) {
+    __try {
+        auto player=((unsigned char**)((unsigned char*)self+48))[owner];
+        volatile int used=*(int*)(player+0xe24);(void)used;
+    } __except(GetExceptionCode()==EXCEPTION_ACCESS_VIOLATION?EXCEPTION_EXECUTE_HANDLER:EXCEPTION_CONTINUE_SEARCH) {return true;}
+    return false;
 }
 uint32_t __fastcall fakeAdvance(void* self,void*,uint32_t,uint32_t) {
     if(playback) {
@@ -333,6 +352,24 @@ int wmain(int argc,wchar_t** argv) {
     require(base!=0,"fixture memory");
     textBase=base;textSize=0x882000;expectedText.resize(textSize);
     {
+        auto previousProc=oldWindowProc;oldWindowProc=fakeHotkeyWindow;
+        for(bool running:{false,true}) for(bool ended:{false,true}) {
+            playback=true;active=running;terminal.store(ended);
+            for(UINT message:{WM_KEYDOWN,WM_KEYUP,WM_SYSKEYDOWN,WM_SYSKEYUP}) {
+                unsigned before=forwardedHotkeys;
+                require(recordingWindowProc(nullptr,message,VK_F5,0)==0 &&
+                        recordingWindowProc(nullptr,message,VK_F5,1L<<30)==0 && forwardedHotkeys==before,
+                        "F5 reload blocked during playback: loading/active/terminal, repeats and release");
+            }
+        }
+        playback=false;active=false;terminal.store(false);
+        for(UINT message:{WM_KEYDOWN,WM_KEYUP,WM_SYSKEYDOWN,WM_SYSKEYUP})
+            require(recordingWindowProc(nullptr,message,VK_F5,0)==987,"F5 normal-play and recording input preserved");
+        playback=true;
+        require(recordingWindowProc(nullptr,WM_KEYDOWN,VK_F6,0)==987,"unrelated function keys preserve existing behavior");
+        playback=false;oldWindowProc=previousProc;
+    }
+    {
         minimapAlarmBlit=fakeAlarmBlit;playback=true;active=true;
         replayMinimapAlarmBlit(nullptr,nullptr,0,0,0);
         require(alarmBlits==0,"replay minimap alarm pixels suppressed without skipping renderer lifecycle");
@@ -375,14 +412,41 @@ int wmain(int argc,wchar_t** argv) {
         *(int16_t*)(object+0x1484)=1;researchProgressHook(object,nullptr);
         require(observerUpgrades[0].completed && observerUpgrades[0].completedAt==100,"completion effect requires native research completion transition");
         bool wasParticipant=observerPlayers[0].participant;observerPlayers[0].participant=true;
+        {
+            unsigned char training[0x1600]{};*(int16_t*)(training+6)=1;*(uint16_t*)(training+0x14)=100;
+            *(uint16_t*)(training+0xc)=0x28a0;*(int16_t*)(training+0x14c2)=2;*(int16_t*)(training+0x1488)=1;
+            *(int16_t*)(training+0x12e)=105;*(int16_t*)(training+0x1484)=167;
+            int type=0,remaining=0,owner=0;
+            require(!observerTrainingHero(training,30,type,remaining,owner),"hero warning does not appear before five simulation seconds");
+            *(int16_t*)(training+0x1484)=166;
+            unsigned char preserved[sizeof(training)];memcpy(preserved,training,sizeof(training));
+            require(observerTrainingHero(training,30,type,remaining,owner) && type==105 && remaining==166 && owner==0,"hero production warning uses active hero order and actual remaining ticks");
+            require(!memcmp(preserved,training,sizeof(training)),"hero production display never modifies simulation state");
+            for(int heroType:{29,30,31,32,33,34,35,105,106,107,108,111}) {
+                *(int16_t*)(training+0x12e)=(int16_t)heroType;
+                require(observerTrainingHero(training,30,type,remaining,owner),"all requested heroes support production countdown");
+            }
+            *(int16_t*)(training+0x12e)=0;require(!observerTrainingHero(training,30,type,remaining,owner),"ordinary units do not trigger hero warning");
+            *(int16_t*)(training+0x12e)=108;*(int16_t*)(training+0x14c2)=1;
+            require(!observerTrainingHero(training,30,type,remaining,owner),"supply-blocked production does not claim imminent completion");
+            *(int16_t*)(training+0x14c2)=2;*(int16_t*)(training+0x1484)=0;
+            require(!observerTrainingHero(training,30,type,remaining,owner),"completed production clears countdown");
+            *(int16_t*)(training+0x1484)=100;*(uint16_t*)(training+0xc)=0x27d8;
+            require(!observerTrainingHero(training,30,type,remaining,owner),"cancelled production clears countdown");
+            *(uint16_t*)(training+0xc)=0x28a0;*(uint16_t*)(training+0x14)=0;
+            require(!observerTrainingHero(training,30,type,remaining,owner),"destroyed producer clears countdown");
+            *(uint16_t*)(training+0x14)=100;
+            require(!observerTrainingHero(training,0,type,remaining,owner) && !observerTrainingHero(training,1001,type,remaining,owner),"invalid simulation interval cannot create hero alert");
+        }
+
         *(int16_t*)(object+6)=0;*(uint16_t*)(object+0x14)=100;
         *(int16_t*)(object+0x1a8)=5;*(int16_t*)(object+0x1aa)=20;
         *(int*)(object+0x35c)=99; // Unrelated unit field: old code read this.
         for(int heroType:{105,108}) {
-            *(int16_t*)(object+4)=(int16_t)heroType;observerHeroCount=0;refreshObserverHeroes();
+            *(int16_t*)(object+4)=(int16_t)heroType;observerHeroCount=0;observerOverlayCacheValid=false;refreshObserverHeroes();
             require(observerHeroCount==1 && observerHeroes[0].level==5,"Russelaunt and Lauriana show native base level five rather than information-panel cache offset");
         }
-        *(int16_t*)(object+0x1a8)=7;observerHeroCount=0;refreshObserverHeroes();
+        *(int16_t*)(object+0x1a8)=7;observerHeroCount=0;observerOverlayCacheValid=false;refreshObserverHeroes();
         require(observerHeroes[0].level==7,"hero level-up uses live WORD level without fixed base-level override or adjacent field contamination");
         observerPlayers[0].participant=wasParticipant;
         resetObserverExtras();researchProgress=nullptr;producer=0;playback=false;active=false;
@@ -674,7 +738,14 @@ int wmain(int argc,wchar_t** argv) {
     showObserverHud=true;observerHudRedrawFrames=0;
     toggleObserverHud();require(!showObserverHud && !observerHudRedrawFrames,"hide HUD cancels pending full redraw");
     toggleObserverHud();require(showObserverHud && observerHudRedrawFrames==3,"show HUD schedules display buffer restoration");
-    require(redrawObserverSurface(self,(Process)fakeResultRender,(Process)fakeFullSurface)==456,"HUD restore draws all retained sprites instead of dirty list");
+    unsigned char redrawGame[0x80]{},redrawPlayer[0x600]{},redrawUi[0x20]{};
+    auto previousGame=at<void*>(0xb8282c);at<void*>(0xb8282c)=redrawGame;
+    ((void**)(redrawGame+0x48))[2]=redrawPlayer;*(void**)(redrawPlayer+0x5e0)=redrawUi;*(void**)(redrawUi+0x10)=self;
+    require(redrawObserverSurface(self,(Process)fakeResultRender,(Process)fakeFullSurface)==456,"HUD restore redraws its retained UI surface");
+    require(redrawObserverSurface(redrawGame,(Process)fakeResultRender,(Process)fakeFullSurface)==123,"HUD restore preserves incremental world/effect rendering instead of repainting every sprite");
+    at<void*>(0xb8282c)=nullptr;
+    require(redrawObserverSurface(self,(Process)fakeResultRender,(Process)fakeFullSurface)==123,"missing game cannot force unrelated full redraw");
+    at<void*>(0xb8282c)=previousGame;
     observerHudRedrawFrames=0;
     require(redrawObserverSurface(self,(Process)fakeResultRender,(Process)fakeFullSurface)==123,"normal HUD frames retain incremental rendering");
     auto ui=(unsigned char*)address(0x620000);memset(ui,0,0x1908);
@@ -833,10 +904,9 @@ int wmain(int argc,wchar_t** argv) {
     // Population belongs to writer metadata, with ordinals across every command.
     resetState();playback=false;active=true;inDispatch=true;head.store(0);tail.store(0);
     producer=GetCurrentThreadId();populationOrdinal=0;populationSamples=0;initial.state.tick=100;at<uint32_t>(0xb8a280)=101;
-    unsigned char populationPlayer[0xe30]{};*(int*)(populationPlayer+0xe24)=12;
-    ((void**)(self+48))[0]=populationPlayer;
-    auto capacityStub=(unsigned char*)address(0x522760);
-    const unsigned char returnTen[]={0xb8,10,0,0,0,0xc3};memcpy(capacityStub,returnTen,sizeof(returnTen));
+    unsigned char populationPlayer[0xe30]{};*(int*)(populationPlayer+0xe24)=12;*(int*)(populationPlayer+0xe28)=10;
+    ((void**)(self+0x48))[0]=populationPlayer;
+    at<void*>(0xb8282c)=self;
     uint32_t otherOrder=5;commandHook(self,nullptr,4,&otherOrder);
     uint16_t productionOrder[4]={400,0,0,0};commandHook(self,nullptr,8,productionOrder);
     uint32_t position=0;PopulationSample sample{};bool foundPopulation=false;
@@ -847,7 +917,76 @@ int wmain(int argc,wchar_t** argv) {
     }
     require(foundPopulation && sample.ordinal==1 && sample.tick==101 && sample.player==0 && sample.used==12 && sample.capacity==10,"opening supply captures correct command ordinal, owner and actual over-cap population");
     require(*(int*)(populationPlayer+0xe24)==12,"population metadata does not modify player state");
-    active=false;inDispatch=false;((void**)(self+48))[0]=nullptr;
+    active=false;inDispatch=false;((void**)(self+0x48))[0]=nullptr;
+    // Independent native-layout evidence: CGame map columns at +38, players at
+    // +48 hexadecimal (4c6f40). Old decimal +48 reaches columns for player 2.
+    *(uint32_t*)(self+0x38)=256;
+    require(legacyPopulationReadFaults(self,2),"pre-fix population capture reproduces access violation on map width interpreted as a player pointer");
+    printf("REPRODUCED_OLD_POPULATION_ACCESS_VIOLATION: player 2 aliases map columns\n");
+    unsigned char players[8][0xe30]{};
+    for(unsigned owner=0;owner<8;++owner) {
+        ((void**)(self+0x48))[owner]=players[owner];
+        *(int*)(players[owner]+0xe24)=12+owner;*(int*)(players[owner]+0xe28)=10+owner;
+    }
+    apply=(Apply)fakeProductionApply;
+    const uint16_t opcodes[]={400,401,500,170,5170};
+    for(unsigned networkMode:{0u,1u}) {
+        State baseline{};
+        for(bool record:{false,true}) {
+            resetState();playback=false;active=record;inDispatch=record;producer=GetCurrentThreadId();
+            at<unsigned char>(0xb83ad0)=(unsigned char)networkMode;
+            head.store(0);tail.store(0);populationOrdinal=0;populationSamples=0;initial.state.tick=1;
+            productionApplyCalls=0;
+            for(unsigned owner=0;owner<8;++owner) for(auto opcode:opcodes) {
+                uint16_t order[6]={opcode,(uint16_t)owner,1,2,3,4};uint16_t savedOrder[6];memcpy(savedOrder,order,sizeof(order));
+                uint32_t length=(opcode==170 || opcode==5170)?12:8;
+                require(commandHook(self,nullptr,length,order)==length+opcode+owner,"recording preserves original command return value");
+                require(!memcmp(savedOrder,order,sizeof(order)),"recording never edits command bytes");
+            }
+            require(productionApplyCalls==40 && at<unsigned char>(0xb83ad0)==networkMode && at<void*>(0xb870c8)==&queue && queue==vtable,"all commands reach native handler exactly once without replacing network queue or mode");
+            State actual{};require(snapshot(self,actual),"capture A/B fixture state");
+            if(!record) baseline=actual;
+            else {
+                require(same(baseline,actual),"recording on/off produces identical resources, RNG and checksum for all player slots and production opcodes");
+                unsigned samples=0;uint32_t offset=0;
+                while(offset<head.load()) {
+                    Record r{};readRing(offset,&r,sizeof(r));
+                    if(r.kind==Population) {
+                        PopulationSample p{};readRing(offset+sizeof(r),&p,sizeof(p));
+                        require(p.player<8 && p.used==12+p.player && p.capacity==10+p.player,"population comes from the actual command owner's native player slot");++samples;
+                    }
+                    offset+=sizeof(r)+r.size;
+                }
+                require(samples==40 && !failed.load(),"all eight owners retain optional metadata in single and multiplayer recording");
+            }
+        }
+    }
+    int used=0,capacity=0;
+    *(int*)(players[0]+0xe28)=500;*(int*)(players[0]+0xe2c)=7;
+    at<uint16_t>(0xb83ad2)=0;self[0xc79]=1;
+    require(capturePopulation(self,0,used,capacity) && capacity==277,"base rules population limit and bonus");
+    self[0xc79]=2;require(capturePopulation(self,0,used,capacity) && capacity==307,"expanded rules population limit and bonus");
+    at<uint16_t>(0xb83ad2)=1;require(capturePopulation(self,0,used,capacity) && capacity==407,"campaign population limit and bonus");
+    require(!capturePopulation(self,8,used,capacity),"invalid population owner rejected");
+    for(void* invalid:{(void*)nullptr,(void*)0x100}) {
+        ((void**)(self+0x48))[2]=invalid;unsigned before=productionApplyCalls;
+        uint16_t order[4]={400,2,0,0};
+        require(commandHook(self,nullptr,8,order)==410 && productionApplyCalls==before+1 && !failed.load(),"missing or unreadable optional population cannot skip or abort original game command");
+    }
+    require(populationReadFailures.load()>=2,"optional metadata read failure available to worker diagnostics");
+    unsigned beforeOverflow=productionApplyCalls;head.store(RingSize);tail.store(0);
+    uint16_t overflowOrder[4]={400,0,0,0};
+    require(commandHook(self,nullptr,8,overflowOrder)==408 && productionApplyCalls==beforeOverflow+1 && failed.load(),"full recording ring stops capture but does not stop multiplayer command application");
+    head.store(0);tail.store(0);active=false;inDispatch=false;
+    nativeSyncReady.store(false);self[0x46c]=1;*(uint32_t*)(self+0x664)=2;
+    *(uint32_t*)(self+0x3e4)=123;*(uint32_t*)(self+0x410)=456;
+    unsigned char unchangedGame[sizeof(self)];memcpy(unchangedGame,self,sizeof(self));
+    playback=true;observeRecordingSync(self);require(!nativeSyncReady.load(),"playback is not diagnosed as a live multiplayer sync error");
+    playback=false;at<unsigned char>(0xb83ad0)=0;observeRecordingSync(self);require(!nativeSyncReady.load(),"single player is not diagnosed as multiplayer sync error");
+    at<unsigned char>(0xb83ad0)=1;observeRecordingSync(self);
+    require(nativeSyncReady.load() && nativeSyncDiagnostic.localPlayer==2 && nativeSyncDiagnostic.reportTicks[0]==123 && nativeSyncDiagnostic.checksums[0]==456 && !memcmp(unchangedGame,self,sizeof(self)),"native sync evidence captured without suppressing flag or changing game state, even after recording failure");
+    *(uint32_t*)(self+0x410)=789;observeRecordingSync(self);
+    require(nativeSyncDiagnostic.checksums[0]==456,"preserve first sync error evidence for worker without repeated writes");
     printf("NATIVE_ENGINE_TESTS_PASS: capture/replay, live-input separation, RNG/state mismatch, overflow, patch integrity/restoration\n");
     return 0;
 }

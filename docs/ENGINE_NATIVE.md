@@ -1,4 +1,4 @@
-## 0.2.32 공간 이벤트 소리 복원
+﻿## 0.2.32 공간 이벤트 소리 복원
 
 - 5213cf..521409와 53d85d..53d87a는 음성 이벤트 번호 4를 공간 소리로 처리합니다. 0.2.29에서 이 두 지점을 통상 대사와 함께 음소거한 것이 누락 가능 경로입니다. 리플레이에서는 효과음 음량 b8a1e0을 전달하고 일반 541a40 응답 음성은 계속 음소거합니다. 사용자 효과음 0 설정과 일반 플레이 인자는 유지합니다.
 - 효과음 음량 사용/효과음 음소거 보존/일반 플레이 보존 모형 시험을 수행합니다. 실제 모든 진영의 사망 소리 및 이벤트 번호의 전체 음원 목록 청취 검증은 미완료입니다.
@@ -417,3 +417,102 @@ Only 26px PNG thumbnails are created in memory; no game graphics are distributed
 Missing assets leave activity text usable. No trace or simulation changes.
 Validation: Python 57 tests, actual 112/112 event icon coverage on the Sylphid
 record including Lauriana, and visual inspection of unit/building rows.
+
+
+### 0.2.59 prevent native Ctrl+F5 quick-load during playback
+
+Actual 0.2.58 playback of the observer Requiem record was interrupted by Ctrl+F5:
+the native quick-load screen opened, then engine code 6 and the mismatch dialog
+appeared. Evidence: build/ctrl-f5-verification-0.2.59/before.log.
+
+recordingWindowProc now consumes WM_KEYDOWN/UP and WM_SYSKEYDOWN/UP for VK_F5
+throughout a playback session, including pre-map and terminal states. It blocks
+F5 regardless of Ctrl's current state, so release order and autorepeat cannot
+leak into native quick-load processing. It does not modify the stored command
+stream, rules identifier, RNG, checksum, recording-mode input, other function
+keys, or integrity verification.
+
+Native regression coverage exercises both active flags and terminal flags,
+ordinary/repeated F5 and system-key variants, normal-mode forwarding and F6
+forwarding. Python 57 tests and native tests pass. Actual 1x and 4x Ctrl+F5 plus
+unmodified F5 continue playback with the new engine.
+
+
+### 0.2.60 restrict HUD restoration repaint to hidden UI surfaces
+
+The three-frame restoration path previously replaced every 624f00 layer render
+with 62dda0. That routine visits every retained sprite and renders it, bypassing
+the incremental path even on world/effect surfaces which were never hidden.
+observerHudSurface identifies precisely the CPlayer+5e0 UI renderer at UI+10
+already used by the hidden-HUD path. Only those surfaces receive full restoration
+across the display buffer cycle. All other layers retain normal incremental
+rendering. Minimap regeneration, temporary visibility restoration and gameplay
+state checks are unchanged.
+
+Native tests verify retained-HUD redraw, non-HUD incremental rendering, absent-game
+fallback and the ordinary frame path. Python 57/native checks pass. Actual replay
+HUD/minimap restoration was visually checked. No quantitative latency reduction
+has been measured; crowded late-game and external-PC performance vary.
+
+0.2.60 추가 실게임 검증: 관전자 Requiem 19:48 기록에서 U 숨김·복원과 후반 Ctrl+F5 입력 후 4배속 완주, 최종 tick39612 / seed638571136 / RNG559880 / native checksum651214385 비교 통과(status10). 증거: build/hud-restore-verification-0.2.60/. 지연 개선량은 정량 측정하지 않았습니다.
+
+
+### 0.2.61 hero production countdown
+
+Native training 47c370 uses state 28a0, +12e for the current production target,
++14c2 stage 2 for active training (stage 1 waits for population capacity), and
+47acb0 timer phase +1488=1 with remaining +1484 / total +1486. The observer
+reads these fields and shows the twelve known hero types when remaining times
+the recorded simulation interval is at most 5000ms. It shares the existing
+right-bottom alert stack, using a native hero portrait, player color/name and
+hero name/countdown. Collection shares the existing eight-tick hero scan;
+every paint revalidates object identity, ownership, type and active production.
+Cancellation, completion, death or slot recycling therefore removes the alert.
+H hides the hero status panel only; U hides all these overlays. No simulation
+data, commands, timing or replay format are changed.
+
+Native regression tests cover the 5000ms threshold, all twelve hero IDs,
+ordinary units, capacity wait, cancellation, completion, destroyed buildings,
+invalid intervals and unchanged object bytes. Python 57/native tests pass.
+Actual replay memory confirms Lauriana training at stage 2 / timer phase 1.
+Actual countdown-overlay visual verification and all-hero live combinations remain unconfirmed; the five-second window was passed during screen inspection.
+
+
+### 0.2.62 recording population pointer correction and sync diagnostics
+
+The recording population sampler introduced with the build-order metadata used
+CGame+48 decimal (0x30). Native GetPlayer 4c6f40, specifically 4c6f51, reads
+CGame+0x48+index*4. The old expression aliases map columns at +0x38 for owner 2
+and shifts every player index. A native regression fixture with a normal width
+of 256 reproduces an access violation in the old sampler before command apply.
+The previous test repeated the same wrong layout and did not detect the error.
+This proves a recorder crash defect, not the cause of the user's unspecified
+network sync-error report (version/time/logs unavailable).
+
+capturePopulation uses the verified player table, reads used/base/bonus at
++e24/+e28/+e2c, and reproduces the read-only limits from 522760 and 4319a0(15).
+There are no calls to game functions for this optional metadata. A narrowly
+scoped access-violation guard skips only the population sample on unreadable
+data. The original command runs exactly once with its original bytes and return
+value, including when the recorder ring fills or population is unavailable.
+PO02 is logged once by the worker when an optional sample cannot be read.
+
+4db540..4db699 compares peer checksums at CGame+410 for equal report ticks at
++3e4 and sets +46c when multiple active participants differ. After native advance,
+the recording adapter reads that flag and publishes one bounded first-error
+snapshot (tick, seed, RNG count, local player, ten peer reports and startup
+checksums at +440). The worker logs MS01. No new hook, network replacement,
+exception suppression around native gameplay, or disabled checksum is involved.
+This is a diagnostic of the native mismatch flag, not attribution to launcher,
+network conditions or a particular peer. It also runs if capture has failed.
+
+Verification: native test reproduces the old invalid read; all eight owners and
+400/401/500/170/5170 commands in single/network fixture modes retain identical
+recording-on/off state, RNG, return values, queue and command bytes. Missing,
+unreadable, invalid-owner, population-rule limit, buffer-full and first-sync
+snapshot cases pass. Python 57 tests pass. Actual 1.416a four-player LOCAL custom
+(one human/three AI) trained a Peasant, captured population 2/10, saved on Alt+F4,
+and replayed to status 10 with final tick 2610, seed 934655544, RNG 869 and checksum
+936666868. Evidence is in build/recording-safety-0.2.62/. This is not a two-PC
+network match; the reported network sync error and long multiplayer sessions
+remain unverified. Existing replay format and rules identity are unchanged.

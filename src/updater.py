@@ -5,7 +5,7 @@ import re
 import urllib.request
 from pathlib import Path
 
-VERSION = '0.2.58'
+VERSION = '0.2.63'
 REPO = 'japanoxx-afk/kufreplay'
 ASSET = 'KUFReplayLauncher.exe'
 LIMIT = 100 * 1024 * 1024

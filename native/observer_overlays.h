@@ -1,6 +1,7 @@
 // Observer-only overlays for the verified KUF image; no simulation writes.
 struct ObserverSprite {alignas(16) unsigned char bytes[0x98]{};void* resource=nullptr;void* context=nullptr;};
 struct ObserverHero {int index,owner,type,hp,maxHp,mp,maxMp,level;unsigned char* object;};
+struct ObserverHeroTraining {int index,owner,type,remaining;unsigned char* object;};
 struct ObserverHeroHit {RECT bounds;int index,owner,type;unsigned char* object;};
 ObserverHeroHit observerHeroHits[48]{};unsigned observerHeroHitCount=0;
 struct ObserverUpgrade {
@@ -10,7 +11,9 @@ struct ObserverUpgrade {
 struct ObserverColoredLine {char text[192]{};uint16_t color=0;};
 bool showHeroPanel=true;
 ObserverHero observerHeroes[48]{};unsigned observerHeroCount=0,observerHeroOverflow=0;
-ObserverSprite observerHeroSprites[48]{},observerUpgradeSprites[16]{};
+ObserverSprite observerHeroSprites[48]{},observerUpgradeSprites[16]{},observerHeroTrainingSprites[16]{};
+ObserverHeroTraining observerHeroTraining[64]{};unsigned observerHeroTrainingCount=0;
+bool observerOverlayCacheValid=false;
 ObserverUpgrade observerUpgrades[64]{};
 ObserverColoredLine observerColoredLines[192]{};unsigned observerColoredLineCount=0;
 uint32_t overlayRefreshAt=0;
@@ -28,10 +31,11 @@ const char* observerHeroName(int type) {
 }
 void resetObserverExtras() {
     observerHeroCount=0;observerHeroOverflow=0;overlayRefreshAt=0;
-    observerHeroHitCount=0;
+    observerHeroHitCount=0;observerHeroTrainingCount=0;observerOverlayCacheValid=false;
     // Sprites only borrow native file/context objects and own no heap resource.
     for(auto& sprite:observerHeroSprites) sprite={};
     for(auto& sprite:observerUpgradeSprites) sprite={};
+    for(auto& sprite:observerHeroTrainingSprites) sprite={};
     for(auto& upgrade:observerUpgrades) upgrade={};
     observerColoredLineCount=0;
 }
@@ -82,16 +86,29 @@ bool drawObserverSprite(void* game,ObserverSprite& sprite,void* resource,int fra
     *(int16_t*)(sprite.bytes+0x1c)=0;*(int*)(sprite.bytes+0x28)=0x7ffffff0;
     ((Draw)address(0x475330))(sprite.bytes,0,0);return true;
 }
+bool observerTrainingHero(unsigned char* object,uint32_t interval,int& type,int& remaining,int& owner) {
+    if(!object || *(int16_t*)(object+6)!=1 || !liveObserverUnit(object) ||
+       *(uint16_t*)(object+0xc)!=0x28a0 || *(int16_t*)(object+0x14c2)!=2 ||
+       *(int16_t*)(object+0x1488)!=1) return false;
+    // Native training 47c370: active phase 2 invokes timer 47acb0; phase 1
+    // waits for population capacity. +12e is the current order, not queue tail.
+    type=*(int16_t*)(object+0x12e);remaining=*(int16_t*)(object+0x1484);owner=*(int16_t*)(object+8);
+    return observerHeroName(type) && owner>=0 && owner<8 && observerPlayers[owner].participant &&
+           remaining>0 && interval>0 && interval<=1000 && (uint64_t)remaining*interval<=5000;
+}
 void refreshObserverHeroes() {
     uint32_t tick=at<uint32_t>(0xb8a280);
-    if(observerHeroCount && tick-overlayRefreshAt<8) return;
-    overlayRefreshAt=tick;observerHeroCount=0;observerHeroOverflow=0;
+    if(observerOverlayCacheValid && tick-overlayRefreshAt<8) return;
+    observerOverlayCacheValid=true;overlayRefreshAt=tick;observerHeroCount=0;observerHeroOverflow=0;observerHeroTrainingCount=0;
     auto manager=(unsigned char*)at<void*>(0xb870c0);if(!manager) return;
     uint32_t count=*(uint32_t*)(manager+0xdc38),index=*(uint32_t*)(manager+0xdc3c);
     if(count>11264) return;
     // Player order is stable even if the manager's unit list is rearranged.
     for(uint32_t i=0;i<count && index<11264;++i) {
         auto object=observerUnit((int)index);
+        int trainingType=0,trainingRemaining=0,trainingOwner=0;
+        if(observerHeroTrainingCount<64 && observerTrainingHero(object,at<uint32_t>(0xb3bae8),trainingType,trainingRemaining,trainingOwner))
+            observerHeroTraining[observerHeroTrainingCount++]={(int)index,trainingOwner,trainingType,trainingRemaining,object};
         if(object && *(int16_t*)(object+6)==0 && liveObserverUnit(object)) {
             int type=*(int16_t*)(object+4),owner=*(int16_t*)(object+8);
             if(observerHeroName(type) && owner>=0 && owner<8 && observerPlayers[owner].participant) {
@@ -194,8 +211,8 @@ void drawObserverExtras(void* game) {
     if(!showObserverHud || !active || !playback || terminal.load()) return;
     auto resources=(unsigned char*)at<void*>(0xb8280c);if(!resources) return;
     uint32_t interval=at<uint32_t>(0xb3bae8),tick=at<uint32_t>(0xb8a280);
+    refreshObserverHeroes(); // Production warnings remain visible when H hides only hero status.
     if(showHeroPanel) {
-        refreshObserverHeroes();
         int height=at<int>(0xbf258c);
         int rows=std::max(1,(height-160)/80);
         // Reserve the right edge for upgrade notifications.
@@ -247,6 +264,24 @@ void drawObserverExtras(void* game) {
         } else {
             observerText(game,x+56,y+26,line);
         }
+        y-=64;++shown;
+    }
+    for(unsigned i=0;i<observerHeroTrainingCount && shown<16 && y>=150;++i) {
+        const auto& training=observerHeroTraining[i];auto object=observerUnit(training.index);
+        int type=0,remaining=0,owner=0;
+        // Revalidate on every paint: cancel, death and recycled slots disappear
+        // immediately even between collection passes. No simulation data writes.
+        if(object!=training.object || !observerTrainingHero(object,interval,type,remaining,owner) ||
+           type!=training.type || owner!=training.owner) continue;
+        char fallback[16],name[64],line[100];
+        observerColoredName(observerName(owner,fallback),observerPlayers[owner].color,name);
+        uint32_t ms=(uint32_t)remaining*interval;
+        sprintf_s(line,"%s %u.%us",observerHeroName(type),ms/1000,(ms%1000)/100);
+        char visible[20];unsigned nameWidth=observerDisplayName(observerName(owner,fallback),visible);
+        int textWidth=(int)std::max(nameWidth,(unsigned)strlen(line))*8;
+        int x=std::max(12,at<int>(0xbf2588)-40-62-textWidth);
+        drawObserverSprite(game,observerHeroTrainingSprites[shown],*(void**)(resources+0x14+type*4),0,x,y);
+        observerText(game,x+62,y+8,name);observerText(game,x+62,y+26,line);
         y-=64;++shown;
     }
 }

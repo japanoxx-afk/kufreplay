@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 from replay_store import Store
 from updater import VERSION, download_latest
 from engine import ADAPTER, launch_engine, collect_completed, process_alive, replay_time
-from diagnostics import create_report, log_error
+from diagnostics import create_report, create_report_zip, log_error
 from build_order import load_build_order
 
 DEFAULT_GAME = Path(r'C:\Program Files (x86)\Steam\steamapps\common\Kingdom Under Fire War of Heroes\KingdomUnderFire.exe')
@@ -39,8 +39,13 @@ class Launcher:
         ttk.Label(outer, text='Steam 실행 + 싱글·멀티 자동 기록 · 실행 중인 게임은 먼저 닫으세요 · 계정 안내창은 ‘아니요’').pack(anchor='w', pady=(8,0))
         controls = ttk.Frame(outer)
         controls.pack(fill='x', pady=14)
-        for title, fn in [('폴더 열기', self.open_folder), ('리플레이 가져오기', self.import_replay), ('기존 폴더 이전', self.migrate), ('새로고침', self.refresh), ('런처 업데이트', self.update), ('에러코드 폴더 열기', self.open_errors)]:
+        for title, fn in [('폴더 열기', self.open_folder), ('리플레이 가져오기', self.import_replay), ('기존 폴더 이전', self.migrate), ('새로고침', self.refresh), ('런처 업데이트', self.update)]:
             ttk.Button(controls, text=title, command=fn).pack(side='left', padx=(0, 6))
+        reports = ttk.Frame(outer)
+        reports.pack(fill='x', pady=(0, 10))
+        ttk.Button(reports, text='에러리포트로그.zip', command=self.export_report_zip).pack(side='left')
+        ttk.Button(reports, text='에러코드 폴더 열기', command=self.open_errors).pack(side='left', padx=6)
+        ttk.Label(reports, text='선택 리플레이와 최근 원본 기록·진단 로그를 ZIP으로 저장').pack(side='left', padx=6)
         settings = ttk.Frame(outer)
         settings.pack(fill='x', pady=(0, 10))
         ttk.Label(settings, text='최근 자동 기록 보관 개수').pack(side='left')
@@ -248,6 +253,17 @@ class Launcher:
             self.status.set(f'제보용 로그 폴더: {folder}')
         game=self.game_path.get()
         self.work(lambda:create_report(self.store.root,game),done,key='diagnostics')
+
+    def export_report_zip(self):
+        chosen=self.tree.selection()
+        item=self.rows.get(chosen[0]) if chosen else None
+        replay=item[0] if item else None
+        game=self.game_path.get()
+        def done(path):
+            self.status.set(f'에러리포트 ZIP 생성 완료: {path}')
+            os.startfile(path.parent)
+            messagebox.showinfo('에러리포트 ZIP 생성 완료',f'{path.name}\n\n열린 폴더의 이 ZIP 파일을 제보해 주세요.')
+        self.work(lambda:create_report_zip(self.store.root,game,replay),done,key='diagnostics-zip')
 
     def import_replay(self):
         path = filedialog.askopenfilename(filetypes=[('KUF 리플레이', '*.kufreplay')])
